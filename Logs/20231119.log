@@ -1,0 +1,9 @@
+0	13:45:04.348	Compiling 'STR02'
+0	13:45:10.957	Custom indicator HLBand USDJPY,H1: loaded successfully
+0	13:45:11.020	HLBand USDJPY,H1: initialized
+0	13:45:11.254	Custom indicator HLBand USDJPY,Daily: loaded successfully
+0	13:45:11.317	HLBand USDJPY,Daily: initialized
+0	13:45:25.326	HLBand USDJPY,H1: uninit reason 9
+0	13:45:25.326	HLBand USDJPY,Daily: uninit reason 9
+0	13:45:25.451	Custom indicator HLBand USDJPY,H1: removed
+0	13:45:25.482	Custom indicator HLBand USDJPY,Daily: removed
