@@ -1,1 +1,3 @@
-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
+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
+
+git push時に、PWとして上記のtokenを入力
