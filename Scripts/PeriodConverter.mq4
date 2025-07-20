@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                              PeriodConverter.mq4 |
-//|                   Copyright 2006-2015, MetaQuotes Software Corp. |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
 //|                                        http://www.metaquotes.net |
 //+------------------------------------------------------------------+
-#property copyright   "2006-2015, MetaQuotes Software Corp."
-#property link        "http://www.mql4.com"
+#property copyright   "2000-2025, MetaQuotes Ltd."
+#property link        "https://www.mql5.com"
 #property description "Period Converter to updated format of history base"
 #property strict
 #property show_inputs
@@ -33,7 +33,7 @@ void OnStart()
    ExtHandle=FileOpenHistory(c_symbol+(string)i_period+".hst",FILE_BIN|FILE_WRITE|FILE_SHARE_WRITE|FILE_SHARE_READ|FILE_ANSI);
    if(ExtHandle<0)
       return;
-   c_copyright="(C)opyright 2003, MetaQuotes Software Corp.";
+   c_copyright="Copyright 2005-2025, MetaQuotes Ltd.";
    ArrayInitialize(i_unused,0);
 //--- write history file header
    FileWriteInteger(ExtHandle,file_version,LONG_VALUE);

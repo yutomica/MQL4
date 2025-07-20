@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                  Heiken Ashi.mq4 |
-//|                   Copyright 2006-2014, MetaQuotes Software Corp. |
-//|                                              http://www.mql4.com |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
+//|                                              http://www.mql5.com |
 //+------------------------------------------------------------------+
-#property copyright   "2006-2014, MetaQuotes Software Corp."
-#property link        "http://www.mql4.com"
+#property copyright   "Copyright 2005-2025, MetaQuotes Ltd."
+#property link        "https://www.mql5.com"
 #property description "We recommend next chart settings (press F8 or select menu 'Charts'->'Properties...'):"
 #property description " - on 'Color' Tab select 'Black' for 'Line Graph'"
 #property description " - on 'Common' Tab disable 'Chart on Foreground' checkbox and select 'Line Chart' radiobutton"

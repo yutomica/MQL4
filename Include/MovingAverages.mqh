@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                               MovingAverages.mqh |
-//|                   Copyright 2009-2013, MetaQuotes Software Corp. |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
 //|                                              http://www.mql5.com |
 //+------------------------------------------------------------------+
-#property copyright "2009, MetaQuotes Software Corp."
-#property link      "http://www.mql5.com"
+#property copyright "2000-2025, MetaQuotes Ltd."
+#property link      "https://www.mql5.com"
 //+------------------------------------------------------------------+
 //| Simple Moving Average                                            |
 //+------------------------------------------------------------------+

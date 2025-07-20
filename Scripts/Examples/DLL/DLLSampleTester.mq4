@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //|                                              DLLSampleTester.mq4 |
-//|                 Copyright © 2005-2016, MetaQuotes Software Corp. |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
 //|                                       http://www.metaquotes.net/ |
 //+------------------------------------------------------------------+
-#property copyright "Copyright © 2005-2016, MetaQuotes Software Corp."
+#property copyright "2000-2025, MetaQuotes Ltd."
 #property link      "http://www.metaquotes.net/"
 
 #import "DLLSample.dll"

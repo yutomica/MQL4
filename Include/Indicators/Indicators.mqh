@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                                   Indicators.mqh |
-//|                   Copyright 2009-2013, MetaQuotes Software Corp. |
-//|                                              http://www.mql4.com |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
+//|                                              http://www.mql5.com |
 //+------------------------------------------------------------------+
 #include <Arrays\ArrayObj.mqh>
 #include "Trend.mqh"

@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                    BmpButton.mqh |
-//|                   Copyright 2009-2013, MetaQuotes Software Corp. |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
 //|                                              http://www.mql5.com |
 //+------------------------------------------------------------------+
 #include "WndObj.mqh"

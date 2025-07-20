@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                   PipeClient.mq4 |
-//|                   Copyright 2012-2014, MetaQuotes Software Corp. |
-//|                                              http://www.mql4.com |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
+//|                                              http://www.mql5.com |
 //+------------------------------------------------------------------+
-#property copyright   "Copyright 2012-2014, MetaQuotes Software Corp."
-#property link        "http://www.mql4.com"
+#property copyright   "Copyright 2005-2025, MetaQuotes Ltd."
+#property link        "https://www.mql5.com"
 #property version     "1.00"
 #property description "Pipe client sample using CFilePipe standard class"
 #property strict

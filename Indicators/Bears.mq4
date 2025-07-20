@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                        Bears.mq4 |
-//|                   Copyright 2005-2014, MetaQuotes Software Corp. |
-//|                                              http://www.mql4.com |
+//|                             Copyright 2000-2025, MetaQuotes Ltd. |
+//|                                              http://www.mql5.com |
 //+------------------------------------------------------------------+
-#property copyright   "2005-2014, MetaQuotes Software Corp."
-#property link        "http://www.mql4.com"
+#property copyright   "2000-2025, MetaQuotes Ltd."
+#property link        "https://www.mql5.com"
 #property description "Bears Power"
 #property strict
 
