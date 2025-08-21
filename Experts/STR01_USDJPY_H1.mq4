@@ -25,7 +25,7 @@
 //| EAパラメータ設定情報                                             |
 //+------------------------------------------------------------------+
 extern double Safety_ratio = 3.0;
-extern int Slippage = 3;
+extern int Slippage = 50;
 extern int En_bars = 20;
 extern int SL_bars = 5;
 extern int ATRPeriod = 10;
@@ -177,3 +177,4 @@ void OnTick()
   
 
 }
+
