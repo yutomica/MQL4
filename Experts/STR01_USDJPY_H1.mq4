@@ -171,7 +171,7 @@ void OnTick()
       }
    }
       
-   TPPips = int(iATR(NULL,0,ATRPeriod,0)*100);
+   TPPips = int(iATR(NULL,0,ATRPeriod,0)*1000);
    CloseHalf(TPPips,3,MAGIC);
    MyTrailingStop(TPPips,MAGIC);
   
