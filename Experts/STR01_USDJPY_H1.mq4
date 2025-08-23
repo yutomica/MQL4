@@ -28,8 +28,8 @@ extern double Safety_ratio = 3.0;
 extern int Slippage = 50;
 extern int En_bars = 20;
 extern int SL_bars = 5;
-extern int ATRPeriod = 10;
-extern double SLLimit = 2.0;
+extern int ATRPeriod = 6;
+extern double SLLimit = 0.8;
 
 
 
@@ -42,7 +42,7 @@ int    gSlippage      = 0;
 color  gArrowColor[6] = {Blue, Red, Blue, Red, Blue, Red}; //BUY: Blue, SELL: Red
 int    fileHandle;
 int    orders_cnt;
-double order_lots;
+double order_lots = 0.05;
 double order_price,TP,SL;
 
 //+------------------------------------------------------------------+
@@ -104,35 +104,26 @@ N/2戦略
 */
 void CloseHalf(double band,int slippage,int magic){
    bool res_cl;
-   bool res_md;
    for(int i=0;i<OrdersTotal();i++){
       if(OrderSelect(i,SELECT_BY_POS)==false) break;
       if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=magic) continue;
       
       if(OrderType() == OP_BUY)
       {
-         if((Bid - OrderOpenPrice() > band*Point) && OrderStopLoss() < OrderOpenPrice()){   
+         if((Bid - OrderOpenPrice() > band*Point) && OrderLots() == order_lots*2){   
             res_cl = false;
-            res_md = false;
             while(!res_cl){
-               while(!res_md){
-                  res_md = OrderModify(OrderTicket(),0,OrderOpenPrice(),0,0,clrDodgerBlue);
-               }
-               res_cl = OrderClose(OrderTicket(),OrderLots()/2,Bid,slippage,clrDodgerBlue);
+               res_cl = OrderClose(OrderTicket(),OrderLots()/2,MarketInfo(Symbol(),MODE_BID),slippage,clrDodgerBlue);
             }
          }
          continue;
       }
       if(OrderType() == OP_SELL)
       {
-         if((OrderOpenPrice()-Ask > band*Point) && OrderStopLoss() > OrderOpenPrice()){
+         if((OrderOpenPrice()-Ask > band*Point) && OrderLots() == order_lots*2){
             res_cl = false;
-            res_md = false;
             while(!res_cl){
-               while(!res_md){
-                  res_md = OrderModify(OrderTicket(),0,OrderOpenPrice(),0,0,clrIndianRed);
-               }
-               res_cl = OrderClose(OrderTicket(),OrderLots()/2,Ask,slippage,clrIndianRed);
+               res_cl = OrderClose(OrderTicket(),OrderLots()/2,MarketInfo(Symbol(),MODE_ASK),slippage,clrIndianRed);
             }
          }
          continue;
@@ -148,7 +139,7 @@ void OnTick()
 {  
    bool newBar = IsNewBar();
    int oTicket;
-   int TPPips;
+   int TPPoints;
    
    orders_cnt = CountPendingOrders(MAGIC);
    
@@ -156,25 +147,21 @@ void OnTick()
       //既存の待機注文をキャンセル
       CancelAllPendingOrders(MAGIC);
       order_price = High[iHighest(NULL, 0, MODE_HIGH, En_bars, 1)];
-      SL = Low[iLowest(NULL, 0, MODE_LOW, SL_bars, 0)];
+      SL = Low[iLowest(NULL, 0, MODE_LOW, SL_bars, 1)];
       TP = 0;
-      order_lots = 0.1;
-      if(order_price-SL<SLLimit){
-         oTicket = SendOrder(OP_BUYSTOP,order_lots,order_price,Slippage,SL,TP,COMMENT,MAGIC);
+      if(order_price-SL<SLLimit && order_price-Ask>MarketInfo(Symbol(),MODE_STOPLEVEL)){
+         oTicket = SendOrder(OP_BUYSTOP,order_lots*2,order_price,Slippage,SL,TP,COMMENT,MAGIC);
       }
       order_price = Low[iLowest(NULL, 0, MODE_LOW, En_bars, 1)];
-      SL = High[iHighest(NULL, 0, MODE_HIGH, SL_bars, 0)];
+      SL = High[iHighest(NULL, 0, MODE_HIGH, SL_bars, 1)];
       TP = 0;
-      order_lots = 0.1;
-      if(SL-order_price<SLLimit){
-         oTicket = SendOrder(OP_SELLSTOP,order_lots,order_price,Slippage,SL,TP,COMMENT,MAGIC);
+      if(SL-order_price<SLLimit && Bid-order_price>MarketInfo(Symbol(),MODE_STOPLEVEL)){
+         oTicket = SendOrder(OP_SELLSTOP,order_lots*2,order_price,Slippage,SL,TP,COMMENT,MAGIC);
       }
    }
-      
-   TPPips = int(iATR(NULL,0,ATRPeriod,0)*1000);
-   CloseHalf(TPPips,3,MAGIC);
-   MyTrailingStop(TPPips,MAGIC);
+    
+   TPPoints = int(iATR(NULL,0,ATRPeriod,0)/Point);
+   CloseHalf(TPPoints,Slippage,MAGIC);
+   MyTrailingStop(TPPoints,MAGIC);
   
-
 }
-
