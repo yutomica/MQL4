@@ -79,8 +79,10 @@ int CountPendingOrders(int magic)
    return(pendingOrderCount);
 }
 
+
 // 指値注文をすべてキャンセルする関数
 void CancelAllPendingOrders(int magic){
+   bool result;
    int totalOrders = OrdersTotal();
    for (int i = totalOrders - 1; i >= 0; i--) {
       if(OrderSelect(i,SELECT_BY_POS)==false) break;
@@ -88,13 +90,12 @@ void CancelAllPendingOrders(int magic){
       int type = OrderType();
       // 指値注文の種類をチェック（Buy Limit, Sell Limit, Buy Stop, Sell Stop）
       if(type == OP_BUYLIMIT || type == OP_SELLLIMIT || type == OP_BUYSTOP || type == OP_SELLSTOP){
-         bool result = OrderDelete(OrderTicket());
-         if (!result) {
-            Print("注文キャンセル失敗: ", OrderTicket(), " エラーコード: ", GetLastError());
-         }else{
-            Print("注文キャンセル成功: ", OrderTicket());
+         result = false;
+         while(!result){
+            result = OrderDelete(OrderTicket());
          }
       }
+      continue;
    }
 }
 
