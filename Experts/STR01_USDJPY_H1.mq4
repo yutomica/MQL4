@@ -93,9 +93,10 @@ void CancelAllPendingOrders(int magic){
          result = false;
          while(!result){
             result = OrderDelete(OrderTicket());
+            if(result){continue;}
+            Sleep(100);
          }
       }
-      continue;
    }
 }
 
