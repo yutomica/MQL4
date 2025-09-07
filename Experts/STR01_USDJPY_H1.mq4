@@ -91,7 +91,13 @@ void CancelAllPendingOrders(int magic){
       // 指値注文の種類をチェック（Buy Limit, Sell Limit, Buy Stop, Sell Stop）
       if(type == OP_BUYLIMIT || type == OP_SELLLIMIT || type == OP_BUYSTOP || type == OP_SELLSTOP){
          result = false;
+         // 待機注文をキャンセルする直前で当該注文が執行されたため、OrderDeleteできずに無限ループに陥ってしまう事象を回避
+         int starttime = GetTickCount();
          while(!result){
+            if(GetTickCount()-starttime > MyOrderWaitingTime*1000){
+               Alert("CancelAllPendingOrders timeout. Check the experts log.");
+               break;
+            }
             result = OrderDelete(OrderTicket());
             if(result){continue;}
             Sleep(100);
