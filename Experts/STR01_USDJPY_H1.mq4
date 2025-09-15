@@ -112,6 +112,7 @@ N/2戦略
 */
 void CloseHalf(double band,int slippage,int magic){
    bool res_cl;
+   int starttime;
    for(int i=0;i<OrdersTotal();i++){
       if(OrderSelect(i,SELECT_BY_POS)==false) break;
       if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=magic) continue;
@@ -120,7 +121,12 @@ void CloseHalf(double band,int slippage,int magic){
       {
          if((Bid - OrderOpenPrice() > band*Point) && OrderLots() == order_lots*2){   
             res_cl = false;
+            starttime = GetTickCount();
             while(!res_cl){
+               if(GetTickCount()-starttime > MyOrderWaitingTime*1000){
+                  Alert("CloseHalf timeout. Check the experts log.");
+                  break;
+               }
                res_cl = OrderClose(OrderTicket(),OrderLots()/2,MarketInfo(Symbol(),MODE_BID),slippage,clrDodgerBlue);
             }
          }
@@ -130,7 +136,12 @@ void CloseHalf(double band,int slippage,int magic){
       {
          if((OrderOpenPrice()-Ask > band*Point) && OrderLots() == order_lots*2){
             res_cl = false;
+            starttime = GetTickCount();
             while(!res_cl){
+               if(GetTickCount()-starttime > MyOrderWaitingTime*1000){
+                  Alert("CloseHalf timeout. Check the experts log.");
+                  break;
+               }               
                res_cl = OrderClose(OrderTicket(),OrderLots()/2,MarketInfo(Symbol(),MODE_ASK),slippage,clrIndianRed);
             }
          }
@@ -138,7 +149,6 @@ void CloseHalf(double band,int slippage,int magic){
       }            
    }
 }
-
 
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
