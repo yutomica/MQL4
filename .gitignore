@@ -1,4 +1,4 @@
 Experts/*.ex4
-Experts/mqlcache.dat
 .vscode/
 Logs/*
+**/mqlcache.dat
