@@ -1,45 +1,43 @@
 ﻿//+------------------------------------------------------------------+
-//|                                                        STR01.mq4 |
+//|                                              STR01_USDJPY_H1.mq4 |
 //|                                  Copyright 2024, MetaQuotes Ltd. |
 //|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
 
 /*
 売買ロジック
-- En: 新バーごとに既存の待機注文を取り消し、確定済み直近En_bars本の最高値へBuy Stop、
-  最安値へSell Stopを同一ロットでOCO発注する。片側が約定すると反対側を取り消す。
-- Ex: 含み益がATRPeriodのATR幅を超えると一度だけ半分を決済する。残りはSL、
-  トレーリングストップ、またはエントリーから10本経過後も損失中の場合の時間決済で終了する。
-- TP/SL: 固定TPは設定しない（TP=0）。初期SLはBuyが確定済み直近SL_bars本の最安値、Sellが最高値。
-  エントリーからSLまでの距離はSLLimitPips未満かつブローカーの最小距離以上を必須とする。
-- トレーリングストップ: 現在足のATR(ATRPeriod)を幅として使用し、SLが建値以上（Sellは建値以下）に
-  なる含み益へ到達後、価格に追随して有利な方向にだけSLを更新する。
-- ポジション数・ロット: 1回のOCOペアにつき約定対象は原則1建玉で、待機注文は同時に最大2件。
-  ロットは残高と有効証拠金の小さい方にEntryRiskPercentを掛け、Buy/Sell双方のSL損失額の厳しい側で算出し、
-  半分決済後も最小ロットを残せる数量へ切り下げる。約定後の余剰証拠金にはFreeMarginBufferPercentを確保する。
-  同時保有建玉数の明示的な上限はなく、同方向・同一価格の重複だけを禁止する。
+- En:
+  新バーごとに既存の待機注文を取り消し、確定済み直近En_bars本の最高値へBuy Stop、最安値へSell Stopを同一ロットでOCO発注する。
+  片側が約定すると反対側を取り消す。
+- Ex: 
+  含み益がATR×HalfATRMultを超えると一度だけ半分を決済する。
+  残りはSL、ATR×TrailATRMultの追尾、またはTimeStopBars本経過後の手数料・swap込み含み損決済で終了する。
+- TP/SL: 
+  固定TPは設定しない（TP=0）。初期SLはBuyが確定済み直近SL_bars本の最安値、Sellが最高値。
+  エントリーからSLまでの距離はSLLimitPips未満かつブローカーの最小距離以上を必須とする。両候補のいずれかが距離上限以上となる局面では、新規発注を見送る。
+- トレーリングストップ: 
+  ATRPeriod・ATRShiftのH1 ATRを幅として使用し、SLが建値以上（Sellは建値以下）になる含み益へ到達後、価格に追随して有利な方向にだけSLを更新する。
+- ポジション数・ロット: 
+  1回のOCOペアにつき約定対象は原則1建玉で、待機注文は同時に最大2件。
+  ロットは残高と有効証拠金の小さい方にEntryRiskPercentを掛け、Buy/Sell双方のSL損失額の厳しい側で算出し、半分決済後も最小ロットを残せる数量へ切り下げる。
+  約定後の余剰証拠金にはFreeMarginBufferPercentを確保する。
+  MaxOpenPositionsで同時保有数を制限し、同方向・同一価格の重複も禁止する。
 */
 
 #include <stderror.mqh>
 #include <stdlib.mqh>
 #include <WinUser32.mqh>
-//#include <Original/Application.mqh>
-#include <Original/Mylib.mqh>
+#include <Original/MyLib.mqh>
 #include <Original/OCO.mqh>
 #include <Original/Basic.mqh>
 #include <Original/DateAndTime.mqh>
 #include <Original/LotSizing.mqh>
 #include <Original/RiskManagement.mqh>
-#include <Original/TrailingStop.mqh>
-#include <Original/TimeStop.mqh>
 #include <Original/Mail.mqh>
 #include <Original/Tracker.mqh>
-//#include <Original/OrderHandle.mqh>
-//#include <Original/OrderReliable.mqh>
 
-
-#define MAGIC 20250822
-#define COMMENT "STR01"
+#define MAGIC 20260912
+#define COMMENT "STR01_USDJPY_H1"
 
 //+------------------------------------------------------------------+
 //| EAパラメータ設定情報                                             |
@@ -48,9 +46,15 @@ extern int Slippage = 50;
 extern int En_bars = 12;
 extern int SL_bars = 7;
 extern int ATRPeriod = 3;
-extern double SLLimitPips = 150.0;
+extern double SLLimitPips = 40.0;
 extern double EntryRiskPercent = 0.25;
 extern double FreeMarginBufferPercent = 30.0;
+extern int TimeStopBars = 10;
+extern int ATRShift = 0;
+extern double HalfATRMult = 3.0;
+extern double TrailATRMult = 3.0;
+extern int MaxOpenPositions = 6; // 0: legacy unlimited entries, for comparison
+extern double MaxSpreadPips = 2.0;
 
 
 //+------------------------------------------------------------------+
@@ -61,6 +65,9 @@ double gPipsPoint     = 0.0;
 int    gSlippage      = 0;
 color  gArrowColor[6] = {Blue, Red, Blue, Red, Blue, Red}; //BUY: Blue, SELL: Red
 int    fileHandle;
+datetime gEquityTick = 0;
+double gLastEquity = 0;
+double gLastBalance = 0;
 int    orders_cnt;
 int    gBuyStopTicket = -1;               // OCO注文のticket番号を保持する変数、-1は未保持
 int    gSellStopTicket = -1;
@@ -85,13 +92,35 @@ int OnInit()
   SL = 0;
   ArrayResize(gHalfClosedKeys,0);
   fileHandle = INVALID_HANDLE;
+  gEquityTick = 0;
+  gLastEquity = AccountEquity();
+  gLastBalance = AccountBalance();
   gPipsPoint = Point;
   if(Digits == 3 || Digits == 5) gPipsPoint *= 10.0;
+  if(StringSubstr(Symbol(),0,6)!="USDJPY" || Period()!=PERIOD_H1){
+     Print("[STR01_rev] USDJPY H1 is required.");
+     return(INIT_PARAMETERS_INCORRECT);
+  }
+  if(En_bars<1 || SL_bars<1 || ATRPeriod<1 || SLLimitPips<=0 ||
+     TimeStopBars<1 || ATRShift<0 || ATRShift>1 ||
+     HalfATRMult<=0 || TrailATRMult<=0 || MaxOpenPositions<0 ||
+     MaxSpreadPips<=0 || Slippage<0){
+     Print("[STR01_rev] Invalid strategy parameter.");
+     return(INIT_PARAMETERS_INCORRECT);
+  }
   if(EntryRiskPercent<=0 ||
      FreeMarginBufferPercent<0 || FreeMarginBufferPercent>=100){
      Print("[STR01] Invalid risk parameter. entryRiskPercent=",EntryRiskPercent,
            " freeMarginBufferPercent=",FreeMarginBufferPercent);
      return(INIT_PARAMETERS_INCORRECT);
+  }
+  if(IsTesting()){
+     fileHandle = FileOpen("STR01_USDJPY_H1_rev_equity.csv",FILE_WRITE|FILE_CSV|FILE_ANSI,',');
+     if(fileHandle==INVALID_HANDLE){
+        Print("[STR01_rev] Cannot open tester equity output. error=",GetLastError());
+        return(INIT_FAILED);
+     }
+     FileWrite(fileHandle,"time","equity","balance");
   }
   gRiskConfigValid = true;
   return(INIT_SUCCEEDED);
@@ -103,8 +132,12 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-  CancelAllPendingOrders(MAGIC);
-  if(fileHandle!=INVALID_HANDLE) FileClose(fileHandle);
+  if(gRiskConfigValid) CancelAllPendingOrders(MAGIC);
+  if(fileHandle!=INVALID_HANDLE){
+     if(gEquityTick>0) FileWrite(fileHandle,TimeToString(gEquityTick,TIME_DATE|TIME_SECONDS),
+                               DoubleToString(gLastEquity,2),DoubleToString(gLastBalance,2));
+     FileClose(fileHandle);
+  }
   fileHandle = INVALID_HANDLE;
   gBuyStopTicket = -1;
   gSellStopTicket = -1;
@@ -332,7 +365,7 @@ bool IsHalfCloseDone(int magic,string &key){
    if(legacyTickSizePrice>0) legacyOpenPriceTicks = (long)MathRound(OrderOpenPrice()/legacyTickSizePrice);
    string legacyKey = keyPrefix+DoubleToString((double)legacyOpenPriceTicks,0);
 
-   for(int i=0;i<ArraySize(gHalfClosedKeys);i++){
+   for(int i=ArraySize(gHalfClosedKeys)-1;i>=0;i--){
       if(gHalfClosedKeys[i]==key || gHalfClosedKeys[i]==legacyKey) return(true);
    }
    if(!IsTesting() && (GlobalVariableCheck(key) || GlobalVariableCheck(legacyKey))) return(true);
@@ -342,7 +375,7 @@ bool IsHalfCloseDone(int magic,string &key){
 // 半分決済の完了状態を記録し、再度の半分決済を防止する
 void MarkHalfCloseDone(string key){
    bool recorded = false;
-   for(int i=0;i<ArraySize(gHalfClosedKeys);i++){
+   for(int i=ArraySize(gHalfClosedKeys)-1;i>=0;i--){
       if(gHalfClosedKeys[i]==key){
          recorded = true;
          break;
@@ -462,6 +495,11 @@ void OnTick()
    bool ocoReady = ApplyOCO(Symbol(),MAGIC,gBuyStopTicket,gSellStopTicket,
                             gPairRollbackRequired,MyOrderWaitingTime);
    bool newBar = IsNewBar();
+   if(IsTesting() && newBar && gEquityTick>0 &&
+      (long)TimeCurrent()/86400!=(long)gEquityTick/86400){
+      FileWrite(fileHandle,TimeToString(gEquityTick,TIME_DATE|TIME_SECONDS),
+                DoubleToString(gLastEquity,2),DoubleToString(gLastBalance,2));
+   }
    int oTicket;
    int TPPoints;
    
@@ -471,6 +509,19 @@ void OnTick()
       bool canPlaceOrders = false;
       if(recoveryReady) canPlaceOrders = CancelAllPendingOrders(MAGIC);
       if(!ocoReady || gPendingRecoveryRequired) canPlaceOrders = false;
+      int openPositions = 0;
+      for(int positionIndex=OrdersTotal()-1;positionIndex>=0;positionIndex--){
+         if(!OrderSelect(positionIndex,SELECT_BY_POS)){
+            canPlaceOrders = false;
+            break;
+         }
+         if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC &&
+            (OrderType()==OP_BUY || OrderType()==OP_SELL)) openPositions++;
+      }
+      if(MaxOpenPositions>0 && openPositions>=MaxOpenPositions) canPlaceOrders = false;
+      RefreshRates();
+      if(Ask-Bid>MaxSpreadPips*gPipsPoint ||
+         Bars<=MathMax(MathMax(En_bars,SL_bars),ATRPeriod+ATRShift)+1) canPlaceOrders = false;
       // 価格刻みに合わせた値で、市場価格・待機注文価格・損切り価格の必要距離を確認する
       if(canPlaceOrders){
          gBuyStopTicket = -1;
@@ -612,9 +663,85 @@ void OnTick()
       Print("[STR01] OCO is not complete. New entries will remain blocked until the state is resolved.");
    }
     
-   TPPoints = int(iATR(NULL,0,ATRPeriod,0)/Point);
-   CloseHalf(TPPoints,Slippage,MAGIC);
-   MyTrailingStop(TPPoints,MAGIC);
-   TimeStop_Exit(Slippage,0,10,MAGIC);
+   double exitATR = iATR(NULL,PERIOD_H1,ATRPeriod,ATRShift);
+   TPPoints = int(exitATR*HalfATRMult/Point);
+   int trailPoints = int(exitATR*TrailATRMult/Point);
+   if(TPPoints>0) CloseHalf(TPPoints,Slippage,MAGIC);
+   // 追尾と時間決済はこのEAの銘柄・Magicだけを処理する。失敗時は次tickで再判定する。
+   double exitTickSize = MarketInfo(Symbol(),MODE_TICKSIZE);
+   double exitStopDistance = NormalizeDouble(MarketInfo(Symbol(),MODE_STOPLEVEL)*Point,Digits);
+   double exitFreezeDistance = NormalizeDouble(MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point,Digits);
+   if(trailPoints>0 && exitTickSize>0 && exitStopDistance>=0 && exitFreezeDistance>=0){
+      for(int trailIndex=OrdersTotal()-1;trailIndex>=0;trailIndex--){
+         ResetLastError();
+         if(!OrderSelect(trailIndex,SELECT_BY_POS)){
+            Print("[STR01_rev] Trailing selection failed. error=",GetLastError());
+            continue;
+         }
+         int trailType = OrderType();
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC ||
+            (trailType!=OP_BUY && trailType!=OP_SELL)) continue;
+         RefreshRates();
+         double newStop = 0;
+         double stopDistance = 0;
+         double takeDistance = 0;
+         bool improvesStop = false;
+         if(trailType==OP_BUY){
+            newStop = NormalizeDouble(MathFloor((Bid-trailPoints*Point)/exitTickSize+1e-7)*exitTickSize,Digits);
+            stopDistance = NormalizeDouble(Bid-newStop,Digits);
+            takeDistance = NormalizeDouble(OrderTakeProfit()-Bid,Digits);
+            improvesStop = newStop>=OrderOpenPrice() &&
+                           (OrderStopLoss()==0 || newStop>OrderStopLoss()+0.5*Point);
+         }
+         else{
+            newStop = NormalizeDouble(MathCeil((Ask+trailPoints*Point)/exitTickSize-1e-7)*exitTickSize,Digits);
+            stopDistance = NormalizeDouble(newStop-Ask,Digits);
+            takeDistance = NormalizeDouble(Ask-OrderTakeProfit(),Digits);
+            improvesStop = newStop<=OrderOpenPrice() &&
+                           (OrderStopLoss()==0 || newStop<OrderStopLoss()-0.5*Point);
+         }
+         if(!improvesStop || stopDistance<exitStopDistance) continue;
+         if(exitFreezeDistance>0 && stopDistance<=exitFreezeDistance) continue;
+         if(OrderTakeProfit()>0 && (takeDistance<exitStopDistance ||
+            (exitFreezeDistance>0 && takeDistance<=exitFreezeDistance))) continue;
+         ResetLastError();
+         if(!OrderModify(OrderTicket(),OrderOpenPrice(),newStop,OrderTakeProfit(),0,gArrowColor[trailType])){
+            int modifyError = GetLastError();
+            Print("[STR01_rev] Trailing modify failed. ticket=",OrderTicket(),
+                  " error=",modifyError," ",ErrorDescription(modifyError));
+         }
+      }
+   }
+   for(int timeIndex=OrdersTotal()-1;timeIndex>=0;timeIndex--){
+      ResetLastError();
+      if(!OrderSelect(timeIndex,SELECT_BY_POS)){
+         Print("[STR01_rev] Time-stop selection failed. error=",GetLastError());
+         continue;
+      }
+      int timeType = OrderType();
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC ||
+         (timeType!=OP_BUY && timeType!=OP_SELL)) continue;
+      if(iBarShift(NULL,PERIOD_H1,OrderOpenTime())<TimeStopBars ||
+         OrderProfit()+OrderSwap()+OrderCommission()>=0) continue;
+      RefreshRates();
+      double closePrice = timeType==OP_BUY ? Bid : Ask;
+      if(exitFreezeDistance>0){
+         double currentSLDistance = NormalizeDouble(timeType==OP_BUY ? Bid-OrderStopLoss() : OrderStopLoss()-Ask,Digits);
+         double currentTPDistance = NormalizeDouble(timeType==OP_BUY ? OrderTakeProfit()-Bid : Ask-OrderTakeProfit(),Digits);
+         if((OrderStopLoss()>0 && currentSLDistance<=exitFreezeDistance) ||
+            (OrderTakeProfit()>0 && currentTPDistance<=exitFreezeDistance)) continue;
+      }
+      ResetLastError();
+      if(!OrderClose(OrderTicket(),OrderLots(),closePrice,Slippage,gArrowColor[timeType])){
+         int timeCloseError = GetLastError();
+         Print("[STR01_rev] Time-stop close failed. ticket=",OrderTicket(),
+               " error=",timeCloseError," ",ErrorDescription(timeCloseError));
+      }
+   }
+   if(IsTesting()){
+      gEquityTick = TimeCurrent();
+      gLastEquity = AccountEquity();
+      gLastBalance = AccountBalance();
+   }
 
 }
