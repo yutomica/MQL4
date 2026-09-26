@@ -13,7 +13,7 @@
   初期設定はRSIEntry=7.5、StopATR=2.5。実運用では起動後最初のH1バーの新規エントリーを見送る。
   AllowNewEntries=falseで新規発注だけを停止し、既存ポジションの決済管理は継続する。
 - エグジット:
-  買いはRSIが50を上回った時、売りはRSIが50を下回った時に全量決済する。
+  買いはRSIがRSIExitを上回った時、売りはRSIが100-RSIExitを下回った時に全量決済する。
   RSIが回復しない場合は、H1でHoldBars本の経過後に決済する。
   時間決済には損益によるフィルターを設けない。
   確定足で成立した決済要求を保持し、毎ティック確認して、失敗時は5秒以上空けて再試行する。
@@ -40,6 +40,7 @@
 //+------------------------------------------------------------------+
 input string TradeSymbol = "USDJPY";
 input double RSIEntry = 7.5;
+input double RSIExit = 40.0;
 input double StopATR = 2.5;
 input int HoldBars = 24;
 input double EntryRiskPercent = 0.25;
@@ -68,7 +69,8 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
 
    // テスター出力ファイルを開く前に、ストラテジーパラメータを検証する。
-   if(RSIEntry <= 0 || RSIEntry >= 50 || StopATR <= 0 || HoldBars < 1 ||
+   if(RSIEntry <= 0 || RSIEntry >= 50 || RSIExit <= 0 || RSIExit >= 50 ||
+      StopATR <= 0 || HoldBars < 1 ||
       EntryRiskPercent <= 0 || MaxSpreadPips <= 0 || MagicNumber <= 0)
       return(INIT_PARAMETERS_INCORRECT);
 
@@ -167,7 +169,7 @@ void OnTick()
       for(int j = 0; j < ArraySize(exitTickets); j++)
          if(exitTickets[j] == ticket) pendingIndex = j;
       bool savedExit = (!IsTesting() && GlobalVariableCheck(exitKey));
-      bool recovered = historyReady && (side == OP_BUY ? rsi > 50 : rsi < 50);
+      bool recovered = historyReady && (side == OP_BUY ? rsi > RSIExit : rsi < 100.0 - RSIExit);
       int heldBars = iBarShift(Symbol(), PERIOD_H1, OrderOpenTime(), false);
       if(pendingIndex < 0 && !savedExit && !recovered && heldBars < HoldBars)
          continue;
