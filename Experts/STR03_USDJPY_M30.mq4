@@ -6,36 +6,41 @@
 運用対象
 - USDJPY/M30、決済需要日限定の東京仲値前後売買。
 - 日本銀行営業日の5の倍数日または月末最終営業日。休日の前倒しなし。
-- JST09:50買い、09:55決済後に売り、10:00決済。ATR20shift2の2倍を初期SLとする。
-- 冬UTC+2/夏UTC+3（米国DST）を想定。祝日対応は2017～2027年。
-- ロットは既定0.1、他EAと異なる正のMagicNumberを使用する。同一EAの重複装着はしない。
+- JST09:50買い、09:55決済後に売り、10:00に半量決済、残余10:30決済。ATR20shift2の2倍を初期SLとする。
+- 冬UTC+2/夏UTC+3（米国DST）を想定。祝日対応は2021～2028年（2028年は暫定）。
+- ロットは既定0.1、他EAと異なる正のMAGICを使用する。同一EAの重複装着はしない。
 
 売買ロジック
 - エントリー:
   M30確定を待たず指定分内で判定し、MaxSpreadPips超過なら発注を見送る。
   前半買いの未約定・SL・損益によらず後半売りを判定するが、買いが残っている間は売らない。
-  FXTFサーバー時刻は米国夏時間の日付規則からJSTへ変換し、日本の休場日は新規発注しない。
+  サーバー時刻は米国夏時間の日付規則からJSTへ変換し、日本の休場日は新規発注しない。
 - エグジット:
-  買いはJST09:55、売りはTokyoExitMinute以後、または約定日の翌日以後に決済する。
+  買いはJST09:55、売りはJST10:00に50%を決済し、残余を10:30に決済する。
+  約定日の翌日以後へ持ち越した場合は全量を決済する。
   決済失敗時は成立した決済シグナルを保持し、後続ティックで再試行する。
 - SL:
   発注時からSLを付け、約定価格からStopATR倍のATR幅へ補正する。固定TPは設定しない。
   SLはtick刻みへ外側に丸める。補正待ちの間も発注時のSLを維持する。
-  TrailATRが正なら同ATR幅以上の含み益から追随し、SLは有利な方向だけへ動かす。
+  買いは0.25ATR順行時に建値SLを試みる。TrailATRが正なら同ATR幅以上の
+  含み益から追随し、SLは有利な方向だけへ動かす。
 - ポジション数・ロット:
-  同一Symbol・MagicNumberの注文がある間は新規発注しない。ロットはFixedLotsの固定値。
+  同一Symbol・MAGICの注文がある間は新規発注しない。ロットはFixedLotsの固定値。
   最小・最大ロット、ロットステップに適合しない設定は初期化時に拒否する。
 - 決済後休止:
   SLを含む最終決済バーの次のバーから、完了した平日のシグナル時間足バーをCooldownDays本数える。
   決済と同じ足には再エントリーしない。ただし09:55の後半売りには休止と同バー制限を適用しない。
-  時刻・曜日はブローカーのサーバー時刻を使い、土日のバーは休止本数に含めない。
+  時刻・曜日はサーバー時刻を使い、土日のバーは休止本数に含めない。
 - テスター出力:
   日ごとの有効証拠金と残高をCSVへ記録する。スワップ・手数料はMT4口座計算に従う。
   保有コストの再現性はテスターの銘柄設定・データに依存する。
 */
 
 #property strict
-#property description "USDJPY/M30 決済需要日限定。JST09:50買い→09:55売り→10:00決済。初期ATR20×2 SLとATR追随。FXTF時刻。"
+
+#define MAGIC 20260926
+#define COMMENT "STR03_USDJPY_M30"
+#property description "USDJPY/M30 決済需要日限定。09:50買い・09:55売り、買い建値SL、売り10:00半量・10:30残余決済。"
 
 //+------------------------------------------------------------------+
 //| EAパラメータ設定情報                                             |
@@ -44,14 +49,16 @@ extern string TradeSymbol = "USDJPY";
 extern int SignalTimeframe = PERIOD_M30; // 選定版はM30固定
 extern int TokyoEntryMinute = 590;     // JST09:50固定
 extern int TokyoExitMinute = 600;      // JST10:00固定
+extern int SellFinalMinute = 630;      // 売り残余の決済時刻: 600/615/630/660
+extern int SellFirstClosePercent = 50; // 売りのJST10:00部分決済率: 30/50/70%
+extern double BuyBreakEvenATR = 0.25;  // 買い建値SL開始: 0/0.125/0.25/0.375/0.5 ATR
 extern int SettlementDaysOnly = 1;     // 1=5の倍数日+月末、休日の前倒しなし（固定）
 extern double StopATR = 2.0;           // 選定版はATR20shift2の2倍に固定
 extern int ATRPeriod = 20;             // ATR期間: 14/20/28/40
 extern int CooldownDays = 1;           // 決済後休止: 完了した平日のシグナル時間足バー数（名前は互換性のため維持）
-extern double FixedLots = 0.1;
+extern double FixedLots = 0.2;
 extern double MaxSpreadPips = 2.0;
-extern int Slippage = 20;              // point単位
-extern int MagicNumber = 20261008;     // 他EA・同時装着するEAと重複させない
+extern int Slippage = 50;              // point単位、各発注・決済要求に適用
 extern string EquityFileName = "";       // 空なら実行時刻を含む一意なCSV名を生成
 extern double TrailATR = 0.75;         // 0=無効、含み益が同ATR幅に達したら追随
 
@@ -72,14 +79,23 @@ int heldTicket = -1;
 string statePrefix = "";
 int lastTokyoEntryDate = 0;
 int lastTokyoSellDate = 0;
-string tokyoHolidays = ",20170101,20170102,20170109,20170211,20170320,20170429,20170503,20170504,20170505,20170717,20170811,20170918,20170923,20171009,20171103,20171123,20171223,20180101,20180108,20180211,20180212,20180321,20180429,20180430,20180503,20180504,20180505,20180716,20180811,20180917,20180923,20180924,20181008,20181103,20181123,20181223,20181224,20190101,20190114,20190211,20190321,20190429,20190430,20190501,20190502,20190503,20190504,20190505,20190506,20190715,20190811,20190812,20190916,20190923,20191014,20191022,20191103,20191104,20191123,20200101,20200113,20200211,20200223,20200224,20200320,20200429,20200503,20200504,20200505,20200506,20200723,20200724,20200810,20200921,20200922,20201103,20201123,20210101,20210111,20210211,20210223,20210320,20210429,20210503,20210504,20210505,20210722,20210723,20210808,20210809,20210920,20210923,20211103,20211123,20220101,20220110,20220211,20220223,20220321,20220429,20220503,20220504,20220505,20220718,20220811,20220919,20220923,20221010,20221103,20221123,20230101,20230102,20230109,20230211,20230223,20230321,20230429,20230503,20230504,20230505,20230717,20230811,20230918,20230923,20231009,20231103,20231123,20240101,20240108,20240211,20240212,20240223,20240320,20240429,20240503,20240504,20240505,20240506,20240715,20240811,20240812,20240916,20240922,20240923,20241014,20241103,20241104,20241123,20250101,20250113,20250211,20250223,20250224,20250320,20250429,20250503,20250504,20250505,20250506,20250721,20250811,20250915,20250923,20251013,20251103,20251123,20251124,20260101,20260112,20260211,20260223,20260320,20260429,20260503,20260504,20260505,20260506,20260720,20260811,20260921,20260922,20260923,20261012,20261103,20261123,20270101,20270111,20270211,20270223,20270321,20270322,20270429,20270503,20270504,20270505,20270719,20270811,20270920,20270923,20271011,20271103,20271123,";
+int lastTokyoSellPartialDate = 0;
+int blockedBuyDate = 0;
+int blockedSellDate = 0;
+datetime nextEntryAttempt = 0;
+int partialBaseDate = 0;
+double partialBaseLots = 0;
+int splitStopDate = 0;
+double splitStopDistance = 0;
+// 2028年は現行祝日法と国立天文台の予測に基づく。2027年2月の官報公表後に再確認。
+string tokyoHolidays = ",20210101,20210111,20210211,20210223,20210320,20210429,20210503,20210504,20210505,20210722,20210723,20210808,20210809,20210920,20210923,20211103,20211123,20220101,20220110,20220211,20220223,20220321,20220429,20220503,20220504,20220505,20220718,20220811,20220919,20220923,20221010,20221103,20221123,20230101,20230102,20230109,20230211,20230223,20230321,20230429,20230503,20230504,20230505,20230717,20230811,20230918,20230923,20231009,20231103,20231123,20240101,20240108,20240211,20240212,20240223,20240320,20240429,20240503,20240504,20240505,20240506,20240715,20240811,20240812,20240916,20240922,20240923,20241014,20241103,20241104,20241123,20250101,20250113,20250211,20250223,20250224,20250320,20250429,20250503,20250504,20250505,20250506,20250721,20250811,20250915,20250923,20251013,20251103,20251123,20251124,20260101,20260112,20260211,20260223,20260320,20260429,20260503,20260504,20260505,20260506,20260720,20260811,20260921,20260922,20260923,20261012,20261103,20261123,20270101,20270111,20270211,20270223,20270321,20270322,20270429,20270503,20270504,20270505,20270719,20270811,20270920,20270923,20271011,20271103,20271123,20280101,20280110,20280211,20280223,20280320,20280429,20280503,20280504,20280505,20280717,20280811,20280918,20280922,20281009,20281103,20281123,";
 
 //+------------------------------------------------------------------+
 //| EA初期化                                                         |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // 売買条件は固定し、ロット・Magic・執行上限は設定可能。
+   // 売買条件とMAGICは固定し、ロット・執行上限は設定可能。
    if(TradeSymbol != "USDJPY" || SignalTimeframe != PERIOD_M30 ||
       TokyoEntryMinute != 590 || TokyoExitMinute != 600 || SettlementDaysOnly != 1 ||
       ATRPeriod != 20 || MathAbs(StopATR - 2.0) > 1e-9 || CooldownDays != 1)
@@ -88,15 +104,35 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
    }
    if(Period() != SignalTimeframe || StringSubstr(Symbol(), 0, 6) != TradeSymbol ||
-      FixedLots <= 0 || MaxSpreadPips <= 0 || Slippage < 0 || MagicNumber <= 0)
+      FixedLots <= 0 || MaxSpreadPips <= 0 || Slippage < 0 || MAGIC <= 0)
       return(INIT_PARAMETERS_INCORRECT);
    if(!MathIsValidNumber(TrailATR) || TrailATR < 0)
       return(INIT_PARAMETERS_INCORRECT);
+   if((SellFinalMinute != 600 && SellFinalMinute != 615 &&
+       SellFinalMinute != 630 && SellFinalMinute != 660) ||
+      (SellFirstClosePercent != 30 && SellFirstClosePercent != 50 &&
+       SellFirstClosePercent != 70))
+      return(INIT_PARAMETERS_INCORRECT);
+   if(!MathIsValidNumber(BuyBreakEvenATR) ||
+      (BuyBreakEvenATR != 0 && BuyBreakEvenATR != 0.125 &&
+       BuyBreakEvenATR != 0.25 && BuyBreakEvenATR != 0.375 && BuyBreakEvenATR != 0.5))
+      return(INIT_PARAMETERS_INCORRECT);
    double step = MarketInfo(Symbol(), MODE_LOTSTEP);
+   double minLot = MarketInfo(Symbol(), MODE_MINLOT);
    if(step <= 0 || FixedLots < MarketInfo(Symbol(), MODE_MINLOT) ||
       FixedLots > MarketInfo(Symbol(), MODE_MAXLOT) ||
       MathAbs(FixedLots / step - MathRound(FixedLots / step)) > 1e-7)
       return(INIT_PARAMETERS_INCORRECT);
+   if(SellFinalMinute > TokyoExitMinute)
+   {
+      double firstLots = NormalizeDouble(MathFloor(FixedLots * SellFirstClosePercent /
+                                                   100.0 / step + 1e-9) * step, 8);
+      double remainingLots = NormalizeDouble(FixedLots - firstLots, 8);
+      if(firstLots < minLot || remainingLots < minLot ||
+         MathAbs(firstLots / step - MathRound(firstLots / step)) > 1e-7 ||
+         MathAbs(remainingLots / step - MathRound(remainingLots / step)) > 1e-7)
+         return(INIT_PARAMETERS_INCORRECT);
+   }
 
    // 運用中に装着・再初期化した場合は新規発注だけを途中参加させない。
    // 既存ポジションの決済・SL補正状態は端末Global Variableから復元する。
@@ -104,7 +140,7 @@ int OnInit()
    {
       lastBar = iTime(Symbol(), SignalTimeframe, 0);
       statePrefix = "STR03." + IntegerToString(AccountNumber()) + "." + Symbol() + "." +
-                    IntegerToString(MagicNumber);
+                    IntegerToString(MAGIC);
       if(StringLen(statePrefix) + 18 > 63)
       {
          Print("Persistent state key is too long for Symbol=", Symbol());
@@ -118,6 +154,14 @@ int OnInit()
          lastTokyoEntryDate = (int)GlobalVariableGet(statePrefix + ".tokyo");
       if(GlobalVariableCheck(statePrefix + ".tokyosell"))
          lastTokyoSellDate = (int)GlobalVariableGet(statePrefix + ".tokyosell");
+      if(GlobalVariableCheck(statePrefix + ".sellpartial"))
+         lastTokyoSellPartialDate = (int)GlobalVariableGet(statePrefix + ".sellpartial");
+      if(GlobalVariableCheck(statePrefix + ".buyblock"))
+         blockedBuyDate = (int)GlobalVariableGet(statePrefix + ".buyblock");
+      if(GlobalVariableCheck(statePrefix + ".sellblock"))
+         blockedSellDate = (int)GlobalVariableGet(statePrefix + ".sellblock");
+      if(GlobalVariableCheck(statePrefix + ".retry"))
+         nextEntryAttempt = (datetime)GlobalVariableGet(statePrefix + ".retry");
       for(int i = OrdersTotal() - 1; i >= 0; i--)
       {
          if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
@@ -125,7 +169,7 @@ int OnInit()
             Print("Init OrderSelect failed error=", GetLastError());
             continue;
          }
-         if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber ||
+         if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC ||
             (OrderType() != OP_BUY && OrderType() != OP_SELL)) continue;
          heldTicket = OrderTicket();
          GlobalVariableSet(heldKey, heldTicket);
@@ -146,7 +190,7 @@ int OnInit()
       if(StringLen(outputName) == 0)
       {
          string outputBase = StringFormat("STR03_TokyoRound_%d_%d_%s_%d_%04d%02d%02d_%02d%02d%02d_equity",
-                                          SignalTimeframe, AccountNumber(), Symbol(), MagicNumber,
+                                          SignalTimeframe, AccountNumber(), Symbol(), MAGIC,
                                           TimeYear(localNow), TimeMonth(localNow), TimeDay(localNow),
                                           TimeHour(localNow), TimeMinute(localNow), TimeSeconds(localNow));
          outputName = outputBase + ".csv";
@@ -301,7 +345,7 @@ void RetryPendingExit(bool &exitAttempted)
       int pendingExit = exitTicket;
       if(!OrderSelect(pendingExit, SELECT_BY_TICKET))
          Print("Exit OrderSelect failed ticket=", pendingExit, " error=", GetLastError());
-      else if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber &&
+      else if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
               (OrderType() == OP_BUY || OrderType() == OP_SELL))
       {
          string pendingPrefix = statePrefix + "." + IntegerToString(pendingExit);
@@ -380,7 +424,7 @@ void CorrectPendingStop(const double tick)
                GlobalVariablesFlush();
             }
          }
-         else if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber &&
+         else if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
                  (OrderType() == OP_BUY || OrderType() == OP_SELL))
          {
             // 発注時に保存したATR幅を使い、約定価格からSLを計算し直す。
@@ -392,9 +436,11 @@ void CorrectPendingStop(const double tick)
             if(MathAbs(OrderStopLoss() - stopTarget) < tick / 2)
             {
                stopTicket = -1;
+               splitStopDistance = 0;
                if(!IsTesting())
                {
                   GlobalVariableDel(stopPrefix + ".stop");
+                  GlobalVariableDel(statePrefix + ".sstop." + IntegerToString(splitStopDate));
                   GlobalVariablesFlush();
                }
             }
@@ -409,9 +455,11 @@ void CorrectPendingStop(const double tick)
                                  OrderTakeProfit(), 0, clrNONE))
                   {
                      stopTicket = -1;
+                     splitStopDistance = 0;
                      if(!IsTesting())
                      {
                         GlobalVariableDel(stopPrefix + ".stop");
+                        GlobalVariableDel(statePrefix + ".sstop." + IntegerToString(splitStopDate));
                         GlobalVariablesFlush();
                      }
                   }
@@ -441,7 +489,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
          orderScanOk = false;
          continue;
       }
-      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC) continue;
       // 待機注文を含め、同じ銘柄・Magicの注文があれば新規発注を止める。
       occupied = true;
       int side = OrderType();
@@ -455,9 +503,10 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
          if(GlobalVariableCheck(activePrefix + ".exit")) exitTicket = activeTicket;
       }
 
+      int openTokyoDate = 0;
       {
          // 約定時点の夏時間を使って約定日をJSTへ変換する。
-         // 買いは09:55、売りは指定の決済時刻、持ち越しは翌日以降に決済する。
+         // 買いは09:55、売りは最終決済時刻、持ち越しは翌日以降に決済する。
          datetime openTime = OrderOpenTime();
          int openYear = TimeYear(openTime);
          datetime openMarchFirst = StringToTime(IntegerToString(openYear) + ".03.01 00:00");
@@ -469,9 +518,9 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
          int openNovemberDate = openYear * 10000 + 1100 + openNovemberSunday;
          bool openSummerTime = (openServerDate >= openMarchDate && openServerDate < openNovemberDate);
          datetime openTokyoTime = openTime + (openSummerTime ? 6 : 7) * 3600;
-         int openTokyoDate = TimeYear(openTokyoTime) * 10000 +
-                             TimeMonth(openTokyoTime) * 100 + TimeDay(openTokyoTime);
-         int tokyoCloseMinute = (side == OP_BUY ? 9 * 60 + 55 : TokyoExitMinute);
+         openTokyoDate = TimeYear(openTokyoTime) * 10000 +
+                         TimeMonth(openTokyoTime) * 100 + TimeDay(openTokyoTime);
+         int tokyoCloseMinute = (side == OP_BUY ? 9 * 60 + 55 : SellFinalMinute);
          if(tokyoDate > openTokyoDate || tokyoMinute >= tokyoCloseMinute)
          {
             // 先に決済意思を保存する。発注失敗や再起動があっても再試行できる。
@@ -482,6 +531,151 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                   Print("Exit state save failed ticket=", activeTicket,
                         " error=", GetLastError());
                GlobalVariablesFlush();
+            }
+         }
+      }
+      // 部分決済でticketが変わっても、残余へ発注時のSL補正幅を引き継ぐ。
+      string splitStopKey = statePrefix + ".sstop." + IntegerToString(openTokyoDate);
+      if(side == OP_SELL)
+      {
+         if(!IsTesting() && GlobalVariableCheck(splitStopKey))
+         {
+            splitStopDate = openTokyoDate;
+            splitStopDistance = GlobalVariableGet(splitStopKey);
+         }
+         if(splitStopDate == openTokyoDate && splitStopDistance > 0)
+         {
+            stopTicket = activeTicket;
+            stopDistance = splitStopDistance;
+         }
+      }
+      // 売りは10:00以降に一度だけ分割し、残りを最終時刻まで保有する。
+      // 全量決済を優先し、初期SL補正待ちでも時刻による分割決済を行う。
+      if(side == OP_SELL && SellFinalMinute > TokyoExitMinute &&
+         tokyoDate == openTokyoDate && tokyoMinute >= TokyoExitMinute &&
+         tokyoMinute < SellFinalMinute && exitTicket != activeTicket)
+      {
+         double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+         double minLot = MarketInfo(Symbol(), MODE_MINLOT);
+         double actualLots = OrderLots();
+         double lotTolerance = MathMax(lotStep * 1e-7, 1e-9);
+         // 設定値ではなく、最初の部分決済要求前の実数量と比較する。
+         string partialBaseKey = statePrefix + ".split." + IntegerToString(openTokyoDate);
+         if(partialBaseDate != openTokyoDate)
+         {
+            partialBaseDate = openTokyoDate;
+            partialBaseLots = actualLots;
+            if(!IsTesting() && GlobalVariableCheck(partialBaseKey))
+               partialBaseLots = GlobalVariableGet(partialBaseKey);
+         }
+         if(actualLots < partialBaseLots - lotTolerance &&
+            lastTokyoSellPartialDate != openTokyoDate)
+         {
+            lastTokyoSellPartialDate = openTokyoDate;
+            if(!IsTesting())
+            {
+               GlobalVariableSet(statePrefix + ".sellpartial", lastTokyoSellPartialDate);
+               GlobalVariablesFlush();
+            }
+         }
+         if(lastTokyoSellPartialDate != openTokyoDate)
+         {
+            double firstLots = (lotStep > 0 ?
+                                NormalizeDouble(MathFloor(actualLots * SellFirstClosePercent /
+                                                         100.0 / lotStep + 1e-9) * lotStep, 8) : 0);
+            double remainingLots = NormalizeDouble(actualLots - firstLots, 8);
+            bool validSplit = (lotStep > 0 && firstLots >= minLot && remainingLots >= minLot &&
+                               MathAbs(firstLots / lotStep - MathRound(firstLots / lotStep)) <= 1e-7 &&
+                               MathAbs(remainingLots / lotStep - MathRound(remainingLots / lotStep)) <= 1e-7);
+            if(!validSplit)
+            {
+               // 運用中に数量条件が変わり分割不能なら、10:00以降は全量決済へ切り替える。
+               exitTicket = activeTicket;
+               if(!IsTesting())
+               {
+                  if(GlobalVariableSet(activePrefix + ".exit", 1) == 0)
+                     Print("Exit state save failed ticket=", activeTicket,
+                           " error=", GetLastError());
+                  GlobalVariablesFlush();
+               }
+            }
+            else
+            {
+               RefreshRates();
+               double partialPrice = Ask;
+               double partialFreeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
+               if(partialFreeze <= 0 || OrderStopLoss() <= 0 ||
+                  MathAbs(partialPrice - OrderStopLoss()) > partialFreeze)
+               {
+                  // 数量と補正幅を先に保存し、約定直後の再起動にも備える。
+                  if(stopTicket == activeTicket)
+                  {
+                     splitStopDate = openTokyoDate;
+                     splitStopDistance = stopDistance;
+                  }
+                  if(!IsTesting())
+                  {
+                     if(GlobalVariableSet(partialBaseKey, partialBaseLots) == 0 ||
+                        (splitStopDate == openTokyoDate && splitStopDistance > 0 &&
+                         GlobalVariableSet(splitStopKey, splitStopDistance) == 0))
+                     {
+                        Print("Partial state save failed ticket=", activeTicket,
+                              " error=", GetLastError());
+                        continue;
+                     }
+                     GlobalVariablesFlush();
+                  }
+                  RefreshRates();
+                  partialPrice = Ask;
+                  if(OrderClose(activeTicket, firstLots, partialPrice, Slippage, clrNONE))
+                  {
+                     lastTokyoSellPartialDate = openTokyoDate;
+                     if(!IsTesting())
+                     {
+                        GlobalVariableSet(statePrefix + ".sellpartial", lastTokyoSellPartialDate);
+                        GlobalVariablesFlush();
+                     }
+                     continue;
+                  }
+                  else Print("Partial exit failed ticket=", activeTicket,
+                             " lots=", DoubleToString(firstLots, 8),
+                             " error=", GetLastError());
+               }
+               continue;
+            }
+         }
+      }
+      // 買いは指定ATR幅の含み益に達したら、約定水準へSLを前進させる。
+      if(side == OP_BUY && BuyBreakEvenATR > 0 &&
+         exitTicket != activeTicket && stopTicket != activeTicket)
+      {
+         double breakEvenAtrValue = iATR(Symbol(), SignalTimeframe, ATRPeriod, 2);
+         double breakEvenTick = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
+         RefreshRates();
+         double breakEvenMarket = Bid;
+         double breakEvenFavorable = breakEvenMarket - OrderOpenPrice();
+         if(breakEvenAtrValue > 0 && breakEvenTick > 0 &&
+            breakEvenFavorable >= BuyBreakEvenATR * breakEvenAtrValue)
+         {
+            // 刻み上の約定値が浮動小数誤差で余分に1tick外側へ丸められるのを防ぐ。
+            double breakEvenStop = NormalizeDouble(MathFloor(OrderOpenPrice() /
+                                                              breakEvenTick + 1e-9) * breakEvenTick,
+                                                    Digits);
+            double breakEvenGap = breakEvenMarket - breakEvenStop;
+            double breakEvenFreeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
+            bool breakEvenImproves = (OrderStopLoss() <= 0 ||
+                                      breakEvenStop > OrderStopLoss() + breakEvenTick / 2);
+            if(breakEvenImproves && breakEvenStop > 0 &&
+               breakEvenGap >= MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + breakEvenTick &&
+               breakEvenGap > breakEvenFreeze &&
+               (breakEvenFreeze <= 0 || OrderStopLoss() <= 0 ||
+                MathAbs(breakEvenMarket - OrderStopLoss()) > breakEvenFreeze))
+            {
+               if(OrderModify(activeTicket, OrderOpenPrice(), breakEvenStop,
+                              OrderTakeProfit(), 0, clrNONE))
+                  continue;
+               Print("Break-even SL failed ticket=", activeTicket,
+                     " error=", GetLastError());
             }
          }
       }
@@ -568,7 +762,7 @@ bool ResolveLastClosedOrder()
          heldResolved = true;
       }
       else if(OrderSelect(heldTicket, SELECT_BY_TICKET) && OrderCloseTime() > 0 &&
-              OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber)
+              OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC)
       {
          if(OrderCloseTime() > lastClose) lastClose = OrderCloseTime();
          heldResolved = true;
@@ -606,7 +800,7 @@ bool PrepareEntryAfterClose(const datetime bar, const bool tokyoSellWindow)
          Print("History OrderSelect failed error=", GetLastError());
          return false;
       }
-      if(OrderSymbol() == Symbol() && OrderMagicNumber() == MagicNumber &&
+      if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
          (OrderType() == OP_BUY || OrderType() == OP_SELL) && OrderCloseTime() > lastClose)
          lastClose = OrderCloseTime();
    }
@@ -656,7 +850,7 @@ bool CheckTokyoEntry(const datetime tokyoNow, const int tokyoDate,
    int tokyoWeekday = TimeDayOfWeek(tokyoNow);
    bool tokyoEntryWindow = (tokyoMinute == TokyoEntryMinute || tokyoSellWindow);
    // 祝日表の対象年、銀行の休業日、指定分内かどうかを確認する。
-   if(tokyoYear < 2017 || tokyoYear > 2027 || dstTransitionSunday ||
+   if(tokyoYear < 2021 || tokyoYear > 2028 || dstTransitionSunday ||
       tokyoWeekday == 0 || tokyoWeekday == 6 ||
       (tokyoMonth == 12 && tokyoDay == 31) ||
       (tokyoMonth == 1 && tokyoDay <= 3) ||
@@ -691,7 +885,7 @@ bool CheckTokyoEntry(const datetime tokyoNow, const int tokyoDate,
             Print("Tokyo history OrderSelect failed error=", GetLastError());
             return false;
          }
-         if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
+         if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC) continue;
          if(OrderType() != (tokyoSellLeg ? OP_SELL : OP_BUY)) continue;
          datetime historyOpen = OrderOpenTime();
          int historyYear = TimeYear(historyOpen);
@@ -729,6 +923,9 @@ bool CheckTokyoEntry(const datetime tokyoNow, const int tokyoDate,
 void OpenTokyoPosition(const datetime now, const double tick,
                        const int tokyoDate, const bool tokyoSellWindow)
 {
+   // 成否不明・恒久エラーの同日同方向再送を止め、一時エラーの連発を抑える。
+   if((tokyoSellWindow ? blockedSellDate : blockedBuyDate) == tokyoDate ||
+      TimeCurrent() < nextEntryAttempt) return;
    // 指定分内でスプレッドを再判定する。
    RefreshRates();
    long bidPoints = (long)MathRound(Bid / Point);
@@ -760,19 +957,47 @@ void OpenTokyoPosition(const datetime now, const double tick,
       Print("Entry skipped: insufficient margin for FixedLots=", FixedLots);
       return;
    }
-   string orderComment = (side == OP_BUY ? "STR03 TokyoRoundBuy " : "STR03 TokyoRoundSell ") +
-                         IntegerToString(SignalTimeframe);
    // 処理中に指定分を過ぎた場合も、遅刻発注は行わない。
    if(TimeCurrent() >= now - TimeSeconds(now) + 60) return;
+   // 送信前に保留を永続化する。成否不明や送信中の再起動では再送しない。
+   string blockKey = statePrefix + (side == OP_SELL ? ".sellblock" : ".buyblock");
+   if(side == OP_SELL) blockedSellDate = tokyoDate;
+   else blockedBuyDate = tokyoDate;
+   if(!IsTesting())
+   {
+      if(GlobalVariableSet(blockKey, tokyoDate) == 0)
+      {
+         Print("Entry state save failed; entry suspended error=", GetLastError());
+         return;
+      }
+      GlobalVariablesFlush();
+   }
+   if(TimeCurrent() >= now - TimeSeconds(now) + 60) return;
    int ticket = OrderSend(Symbol(), side, FixedLots, entry, Slippage, stop, 0,
-                          orderComment, MagicNumber, 0, clrNONE);
+                          COMMENT, MAGIC, 0, clrNONE);
    if(ticket < 0)
    {
       int error = GetLastError();
       Print("Entry failed error=", error);
-      // 休場・売買禁止・価格変更・配信停止・再クオート・取引処理中は後続ティックを待つ。
-      if(error == 132 || error == 133 || error == 135 || error == 136 ||
-         error == 138 || error == 146) lastBar = 0;
+      // 未約定が明確な一時エラーだけ、1秒後以降のティックで再試行する。
+      // 128(timeout)等の成否不明と恒久エラーは、当日の同方向を保留したままにする。
+      if(error == 4 || error == 8 || error == 129 || error == 135 ||
+         error == 136 || error == 137 || error == 138 || error == 141 || error == 146)
+      {
+         nextEntryAttempt = TimeCurrent() + 1;
+         if(!IsTesting())
+         {
+            if(GlobalVariableSet(statePrefix + ".retry", nextEntryAttempt) == 0 ||
+               !GlobalVariableDel(blockKey))
+            {
+               Print("Entry retry state failed; entry suspended error=", GetLastError());
+               return;
+            }
+            GlobalVariablesFlush();
+         }
+         if(side == OP_SELL) blockedSellDate = 0;
+         else blockedBuyDate = 0;
+      }
       return;
    }
    // 発注成功後にだけ、保有チケット、固定SL幅、当日の売買実績を更新する。
