@@ -7,9 +7,11 @@
 売買ロジック
 - エントリー:
   H1の新バーごとに、確定した直近バー（シフト1）だけをシグナル判定に使用する。
-  終値がEMA(200)より上でRSI(2)がRSIEntry未満なら買い成行注文を発注する。
-  終値がEMA(200)より下でRSI(2)が100-RSIEntryより上なら売り成行注文を発注する。
+  終値がEMA(200)より上でRSI(2)がRSIEntry未満なら買いシグナルとする。
+  終値がEMA(200)より下でRSI(2)が100-RSIEntryより上なら売りシグナルとする。
   実口座・デモ口座・テスターで、USDJPYのH1、かつスプレッドがMaxSpreadPips以内の場合だけ新規エントリーする。
+  確定H1 ATR(14)が発注時スプレッドのMinATRSpreadRatio倍（初期17.5）未満なら見送る。0で無効。
+  EntryPullbackATR>0では、シグナル判定バーの終端まで有効なATR押し目・戻り指値を発注する。0で成行注文。
   初期設定はRSIEntry=7.5、StopATR=2.5。実運用では起動後最初のH1バーの新規エントリーを見送る。
   AllowNewEntries=falseで新規発注だけを停止し、既存ポジションの決済管理は継続する。
 - エグジット:
@@ -49,6 +51,8 @@ input int HoldBars = 24;
 input double EntryRiskPercent = 0.25;
 input double MaxSpreadPips = 2.0;
 input bool AllowNewEntries = true; // falseでも既存ポジションの決済は継続する。
+input double MinATRSpreadRatio = 17.5; // 0で無効。ATRとAsk-Bidを同じ価格単位で比較する。
+input double EntryPullbackATR = 0.2; // 0で従来の成行注文。正値ではATR押し目・戻り指値を発注する。
 
 datetime lastBar     = 0;
 datetime lastTick    = 0;
@@ -72,8 +76,8 @@ int OnInit()
 
    // テスター出力ファイルを開く前に、ストラテジーパラメータを検証する。
    if(RSIEntry <= 0 || RSIEntry >= 50 || RSIExit <= 0 || RSIExit >= 50 ||
-      StopATR <= 0 || HoldBars < 1 ||
-      EntryRiskPercent <= 0 || MaxSpreadPips <= 0 || MAGIC <= 0)
+      StopATR <= 0 || HoldBars < 1 || EntryPullbackATR < 0 || EntryRiskPercent <= 0 ||
+      MaxSpreadPips <= 0 || MinATRSpreadRatio < 0 || MAGIC <= 0)
       return(INIT_PARAMETERS_INCORRECT);
 
    // サーバー・銘柄をハッシュ化し、保存キーを63文字以内の英数字で構成する。
@@ -266,17 +270,40 @@ void OnTick()
    double step = MarketInfo(Symbol(), MODE_LOTSTEP);
    if(atr <= 0 || tick <= 0 || tickValue <= 0 || step <= 0)
       return;
+   // 費用に対する回復値幅が小さい局面を除外する。閾値と等しい場合は許可する。
+   if(MinATRSpreadRatio > 0 && atr < MinATRSpreadRatio * (Ask - Bid))
+      return;
+   int orderCmd = side;
+   datetime expiration = 0;
    double entry = (side == OP_BUY ? Ask : Bid);
+   if(EntryPullbackATR > 0)
+   {
+      orderCmd = (side == OP_BUY ? OP_BUYLIMIT : OP_SELLLIMIT);
+      entry = (side == OP_BUY ? Ask - EntryPullbackATR * atr : Bid + EntryPullbackATR * atr);
+      entry = NormalizeDouble((side == OP_BUY ? MathFloor(entry / tick) : MathCeil(entry / tick)) * tick,
+                              Digits);
+      expiration = bar + 3600;
+   }
    double stop = entry + (side == OP_BUY ? -1.0 : 1.0) * StopATR * atr;
 
    // 不利な方向へ丸め、SLがtick刻み上で有効になるように整列する。
    stop = NormalizeDouble((side == OP_BUY ? MathFloor(stop / tick) : MathCeil(stop / tick)) * tick,
                           Digits);
    double minDistance = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick;
-   if(side == OP_BUY && Bid - stop < minDistance)
-      return;
-   if(side == OP_SELL && stop - Ask < minDistance)
-      return;
+   if(EntryPullbackATR > 0)
+   {
+      if(side == OP_BUY && (Ask - entry < minDistance || entry - stop < minDistance))
+         return;
+      if(side == OP_SELL && (entry - Bid < minDistance || stop - entry < minDistance))
+         return;
+   }
+   else
+   {
+      if(side == OP_BUY && Bid - stop < minDistance)
+         return;
+      if(side == OP_SELL && stop - Ask < minDistance)
+         return;
+   }
    // 計算したSLまでの金銭的リスクを基準にポジションサイズを決定する。
    double capital = MathMin(AccountBalance(), AccountEquity());
    double riskPerLot = MathAbs(entry - stop) / tick * tickValue;
@@ -291,9 +318,14 @@ void OnTick()
    double freeAfter = AccountFreeMarginCheck(Symbol(), side, lots);
    if(GetLastError() != 0 || freeAfter < 0.3 * capital)
       return;
-   // ATR初期SLを付け、TPなしの成行注文を送信する。
-   int ticket = OrderSend(Symbol(), side, lots, entry, slippage, stop, 0,
-                          COMMENT, MAGIC, 0, clrNONE);
+   // ATR初期SLを付け、TPなしの成行または期限付き指値注文を送信する。
+   int ticket = OrderSend(Symbol(), orderCmd, lots, entry, slippage, stop, 0,
+                          COMMENT, MAGIC, expiration, clrNONE);
    if(ticket < 0)
       Print("Entry failed error=", GetLastError());
+   else if(EntryPullbackATR > 0)
+      Print("Pending entry ticket=", ticket, " side=", (side == OP_BUY ? "BUY" : "SELL"),
+            " entryATR=", DoubleToString(atr, Digits),
+            " limit=", DoubleToString(entry, Digits),
+            " expiration=", TimeToString(expiration, TIME_DATE | TIME_SECONDS));
 }
