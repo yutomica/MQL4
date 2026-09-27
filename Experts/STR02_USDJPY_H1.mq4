@@ -35,6 +35,9 @@
 #property strict
 #property description "H1 RSI(2) EMA(200)方向押し目・戻り売り。USDJPY H1実運用対応版。"
 
+#define MAGIC 20260913
+#define COMMENT "STR02_USDJPY_H1"
+
 //+------------------------------------------------------------------+
 //| ストラテジーパラメータ                                         |
 //+------------------------------------------------------------------+
@@ -45,7 +48,6 @@ input double StopATR = 2.5;
 input int HoldBars = 24;
 input double EntryRiskPercent = 0.25;
 input double MaxSpreadPips = 2.0;
-input int MagicNumber = 20260913;
 input bool AllowNewEntries = true; // falseでも既存ポジションの決済は継続する。
 
 datetime lastBar     = 0;
@@ -71,7 +73,7 @@ int OnInit()
    // テスター出力ファイルを開く前に、ストラテジーパラメータを検証する。
    if(RSIEntry <= 0 || RSIEntry >= 50 || RSIExit <= 0 || RSIExit >= 50 ||
       StopATR <= 0 || HoldBars < 1 ||
-      EntryRiskPercent <= 0 || MaxSpreadPips <= 0 || MagicNumber <= 0)
+      EntryRiskPercent <= 0 || MaxSpreadPips <= 0 || MAGIC <= 0)
       return(INIT_PARAMETERS_INCORRECT);
 
    // サーバー・銘柄をハッシュ化し、保存キーを63文字以内の英数字で構成する。
@@ -80,7 +82,7 @@ int OnInit()
    for(int k = 0; k < StringLen(scope); k++)
       scopeHash = (scopeHash ^ (uint)StringGetCharacter(scope, k)) * 16777619;
    exitPrefix = "STR02." + IntegerToString(AccountNumber()) + "." +
-                IntegerToString(MagicNumber) + "." + IntegerToString((int)scopeHash) + ".";
+                IntegerToString(MAGIC) + "." + IntegerToString((int)scopeHash) + ".";
    // 実運用では最初の有効なティックで現在足を既処理化する。テスターは従来の開始判定を維持する。
    entryReady = IsTesting();
 
@@ -155,7 +157,7 @@ void OnTick()
          Print("OrderSelect failed ", GetLastError());
          return;
       }
-      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber)
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC)
          continue;
       occupied = true;
       int side = OrderType();
@@ -212,7 +214,7 @@ void OnTick()
          continue;
       }
       if(OrderCloseTime() != 0 || OrderSymbol() != Symbol() ||
-         OrderMagicNumber() != MagicNumber || OrderType() != side)
+         OrderMagicNumber() != MAGIC || OrderType() != side)
          continue;
       double price = (side == OP_BUY ? Bid : Ask);
       double freeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
@@ -291,7 +293,7 @@ void OnTick()
       return;
    // ATR初期SLを付け、TPなしの成行注文を送信する。
    int ticket = OrderSend(Symbol(), side, lots, entry, slippage, stop, 0,
-                          "STR02 trend pullback", MagicNumber, 0, clrNONE);
+                          COMMENT, MAGIC, 0, clrNONE);
    if(ticket < 0)
       Print("Entry failed error=", GetLastError());
 }
