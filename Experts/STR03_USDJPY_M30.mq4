@@ -40,6 +40,9 @@
 
 #define MAGIC 20260926
 #define COMMENT "STR03_USDJPY_M30"
+
+// Log identity is cached once; logging does not query orders or consume errors.
+string gLogIdentity = "";
 #property description "USDJPY/M30 決済需要日限定。09:50買い・09:55売り、買い建値SL、売り10:00半量・10:30残余決済。"
 
 //+------------------------------------------------------------------+
@@ -95,12 +98,21 @@ string tokyoHolidays = ",20210101,20210111,20210211,20210223,20210320,20210429,2
 //+------------------------------------------------------------------+
 int OnInit()
 {
+
+   // Chart and session distinguish parallel charts and subsequent initializations.
+   gLogIdentity = "ea=" + COMMENT + " symbol=" + Symbol() +
+                  " tf=" + StringSubstr(EnumToString((ENUM_TIMEFRAMES)Period()), 7) +
+                  " magic=" + IntegerToString(MAGIC) +
+                  " chart=" + IntegerToString(ChartID()) +
+                  " session=" + IntegerToString((long)TimeLocal()) + "-" +
+                  IntegerToString((long)GetTickCount()) + " ";
+   Print(gLogIdentity, "event=INIT_BEGIN compiled=", __DATETIME__);
    // 売買条件とMAGICは固定し、ロット・執行上限は設定可能。
    if(TradeSymbol != "USDJPY" || SignalTimeframe != PERIOD_M30 ||
       TokyoEntryMinute != 590 || TokyoExitMinute != 600 || SettlementDaysOnly != 1 ||
       ATRPeriod != 20 || MathAbs(StopATR - 2.0) > 1e-9 || CooldownDays != 1)
    {
-      Print("STR03 requires USDJPY/M30, JST590/600, Settlement1 and ATR20/Stop2.");
+      Print(gLogIdentity, "event=INIT_PARAMETERS_INVALID message=", "STR03 requires USDJPY/M30, JST590/600, Settlement1 and ATR20/Stop2.");
       return(INIT_PARAMETERS_INCORRECT);
    }
    if(Period() != SignalTimeframe || StringSubstr(Symbol(), 0, 6) != TradeSymbol ||
@@ -143,7 +155,7 @@ int OnInit()
                     IntegerToString(MAGIC);
       if(StringLen(statePrefix) + 18 > 63)
       {
-         Print("Persistent state key is too long for Symbol=", Symbol());
+         Print(gLogIdentity, "event=STATE_KEY_INVALID message=", "Persistent state key is too long for Symbol=", Symbol());
          return(INIT_PARAMETERS_INCORRECT);
       }
       string closeKey = statePrefix + ".close";
@@ -166,7 +178,7 @@ int OnInit()
       {
          if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
          {
-            Print("Init OrderSelect failed error=", GetLastError());
+            Print(gLogIdentity, "event=INIT_SELECT_FAILED message=", "Init OrderSelect failed error=", GetLastError());
             continue;
          }
          if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC ||
@@ -205,15 +217,16 @@ int OnInit()
                             FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
       if(equityFile == INVALID_HANDLE) return(INIT_FAILED);
       FileWrite(equityFile, "time", "equity", "balance");
-      Print("Equity output=", outputName);
+      Print(gLogIdentity, "event=EQUITY_OUTPUT message=", "Equity output=", outputName);
    }
-   Print("SPEC currency=", AccountCurrency(), " capital=", AccountBalance(),
+   Print(gLogIdentity, "event=SYMBOL_SPEC message=", "SPEC currency=", AccountCurrency(), " capital=", AccountBalance(),
          " tick_size=", SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE),
          " min_lot=", MarketInfo(Symbol(), MODE_MINLOT),
          " lot_step=", step, " spread=", MarketInfo(Symbol(), MODE_SPREAD),
          " swap_type=", MarketInfo(Symbol(), MODE_SWAPTYPE),
          " swap_long=", MarketInfo(Symbol(), MODE_SWAPLONG),
          " swap_short=", MarketInfo(Symbol(), MODE_SWAPSHORT));
+   Print(gLogIdentity, "event=INIT_OK");
    return(INIT_SUCCEEDED);
 }
 
@@ -230,6 +243,7 @@ void OnDeinit(const int reason)
                    DoubleToString(AccountEquity(), 2), DoubleToString(AccountBalance(), 2));
       FileClose(equityFile);
    }
+   Print(gLogIdentity, "event=DEINIT reason=", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -344,7 +358,7 @@ void RetryPendingExit(bool &exitAttempted)
    {
       int pendingExit = exitTicket;
       if(!OrderSelect(pendingExit, SELECT_BY_TICKET))
-         Print("Exit OrderSelect failed ticket=", pendingExit, " error=", GetLastError());
+         Print(gLogIdentity, "event=EXIT_SELECT_FAILED message=", "Exit OrderSelect failed ticket=", pendingExit, " error=", GetLastError());
       else if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
               (OrderType() == OP_BUY || OrderType() == OP_SELL))
       {
@@ -390,7 +404,7 @@ void RetryPendingExit(bool &exitAttempted)
                      GlobalVariablesFlush();
                   }
                }
-               else Print("Exit failed ticket=", pendingExit, " error=", GetLastError());
+               else Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", pendingExit, " error=", GetLastError());
             }
          }
       }
@@ -407,7 +421,7 @@ void CorrectPendingStop(const double tick)
    if(stopTicket >= 0)
    {
       if(!OrderSelect(stopTicket, SELECT_BY_TICKET))
-         Print("SL OrderSelect failed error=", GetLastError());
+         Print(gLogIdentity, "event=SL_SELECT_FAILED message=", "SL OrderSelect failed error=", GetLastError());
       else
       {
          int pendingStop = stopTicket;
@@ -463,7 +477,7 @@ void CorrectPendingStop(const double tick)
                         GlobalVariablesFlush();
                      }
                   }
-                  else Print("SL correction failed ticket=", pendingStop, " error=", GetLastError());
+                  else Print(gLogIdentity, "event=SL_MODIFY_FAILED message=", "SL correction failed ticket=", pendingStop, " error=", GetLastError());
                }
             }
          }
@@ -485,7 +499,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
       {
-         Print("OrderSelect failed error=", GetLastError());
+         Print(gLogIdentity, "event=ORDER_SELECT_FAILED message=", "OrderSelect failed error=", GetLastError());
          orderScanOk = false;
          continue;
       }
@@ -528,7 +542,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
             if(!IsTesting())
             {
                if(GlobalVariableSet(activePrefix + ".exit", 1) == 0)
-                  Print("Exit state save failed ticket=", activeTicket,
+                  Print(gLogIdentity, "event=EXIT_STATE_SAVE_FAILED message=", "Exit state save failed ticket=", activeTicket,
                         " error=", GetLastError());
                GlobalVariablesFlush();
             }
@@ -594,7 +608,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                if(!IsTesting())
                {
                   if(GlobalVariableSet(activePrefix + ".exit", 1) == 0)
-                     Print("Exit state save failed ticket=", activeTicket,
+                     Print(gLogIdentity, "event=EXIT_STATE_SAVE_FAILED message=", "Exit state save failed ticket=", activeTicket,
                            " error=", GetLastError());
                   GlobalVariablesFlush();
                }
@@ -619,7 +633,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                         (splitStopDate == openTokyoDate && splitStopDistance > 0 &&
                          GlobalVariableSet(splitStopKey, splitStopDistance) == 0))
                      {
-                        Print("Partial state save failed ticket=", activeTicket,
+                        Print(gLogIdentity, "event=PARTIAL_STATE_SAVE_FAILED message=", "Partial state save failed ticket=", activeTicket,
                               " error=", GetLastError());
                         continue;
                      }
@@ -637,7 +651,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                      }
                      continue;
                   }
-                  else Print("Partial exit failed ticket=", activeTicket,
+                  else Print(gLogIdentity, "event=PARTIAL_EXIT_FAILED message=", "Partial exit failed ticket=", activeTicket,
                              " lots=", DoubleToString(firstLots, 8),
                              " error=", GetLastError());
                }
@@ -674,7 +688,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                if(OrderModify(activeTicket, OrderOpenPrice(), breakEvenStop,
                               OrderTakeProfit(), 0, clrNONE))
                   continue;
-               Print("Break-even SL failed ticket=", activeTicket,
+               Print(gLogIdentity, "event=BREAK_EVEN_FAILED message=", "Break-even SL failed ticket=", activeTicket,
                      " error=", GetLastError());
             }
          }
@@ -708,7 +722,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
             {
                if(!OrderModify(activeTicket, OrderOpenPrice(), trailStop,
                                OrderTakeProfit(), 0, clrNONE))
-                  Print("Trailing SL failed ticket=", activeTicket, " error=", GetLastError());
+                  Print(gLogIdentity, "event=TRAIL_MODIFY_FAILED message=", "Trailing SL failed ticket=", activeTicket, " error=", GetLastError());
             }
          }
       }
@@ -732,7 +746,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
             GlobalVariablesFlush();
          }
       }
-      else Print("Exit failed ticket=", activeTicket, " error=", GetLastError());
+      else Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", activeTicket, " error=", GetLastError());
    }
    // 照合に失敗した場合は、注文がないと断定せず新規発注を見送る。
    if(!orderScanOk) return false;
@@ -778,7 +792,7 @@ bool ResolveLastClosedOrder()
       // 注文一覧から消えただけでは決済済みと扱わず、確認できるまで待つ。
       if(!heldResolved)
       {
-         Print("Last held ticket unresolved; entry suspended ticket=", heldTicket,
+         Print(gLogIdentity, "event=HELD_TICKET_UNRESOLVED message=", "Last held ticket unresolved; entry suspended ticket=", heldTicket,
                " error=", GetLastError());
          return false;
       }
@@ -797,7 +811,7 @@ bool PrepareEntryAfterClose(const datetime bar, const bool tokyoSellWindow)
    {
       if(!OrderSelect(h, SELECT_BY_POS, MODE_HISTORY))
       {
-         Print("History OrderSelect failed error=", GetLastError());
+         Print(gLogIdentity, "event=HISTORY_SELECT_FAILED message=", "History OrderSelect failed error=", GetLastError());
          return false;
       }
       if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
@@ -882,7 +896,7 @@ bool CheckTokyoEntry(const datetime tokyoNow, const int tokyoDate,
       {
          if(!OrderSelect(j, SELECT_BY_POS, MODE_HISTORY))
          {
-            Print("Tokyo history OrderSelect failed error=", GetLastError());
+            Print(gLogIdentity, "event=TOKYO_HISTORY_SELECT_FAILED message=", "Tokyo history OrderSelect failed error=", GetLastError());
             return false;
          }
          if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC) continue;
@@ -954,7 +968,7 @@ void OpenTokyoPosition(const datetime now, const double tick,
    double freeAfter = AccountFreeMarginCheck(Symbol(), side, FixedLots);
    if(GetLastError() != 0 || freeAfter <= 0)
    {
-      Print("Entry skipped: insufficient margin for FixedLots=", FixedLots);
+      Print(gLogIdentity, "event=ENTRY_MARGIN_REJECTED message=", "Entry skipped: insufficient margin for FixedLots=", FixedLots);
       return;
    }
    // 処理中に指定分を過ぎた場合も、遅刻発注は行わない。
@@ -967,7 +981,7 @@ void OpenTokyoPosition(const datetime now, const double tick,
    {
       if(GlobalVariableSet(blockKey, tokyoDate) == 0)
       {
-         Print("Entry state save failed; entry suspended error=", GetLastError());
+         Print(gLogIdentity, "event=ENTRY_STATE_SAVE_FAILED message=", "Entry state save failed; entry suspended error=", GetLastError());
          return;
       }
       GlobalVariablesFlush();
@@ -978,7 +992,7 @@ void OpenTokyoPosition(const datetime now, const double tick,
    if(ticket < 0)
    {
       int error = GetLastError();
-      Print("Entry failed error=", error);
+      Print(gLogIdentity, "event=ENTRY_FAILED message=", "Entry failed error=", error);
       // 未約定が明確な一時エラーだけ、1秒後以降のティックで再試行する。
       // 128(timeout)等の成否不明と恒久エラーは、当日の同方向を保留したままにする。
       if(error == 4 || error == 8 || error == 129 || error == 135 ||
@@ -990,7 +1004,7 @@ void OpenTokyoPosition(const datetime now, const double tick,
             if(GlobalVariableSet(statePrefix + ".retry", nextEntryAttempt) == 0 ||
                !GlobalVariableDel(blockKey))
             {
-               Print("Entry retry state failed; entry suspended error=", GetLastError());
+               Print(gLogIdentity, "event=ENTRY_RETRY_STATE_FAILED message=", "Entry retry state failed; entry suspended error=", GetLastError());
                return;
             }
             GlobalVariablesFlush();
@@ -1018,13 +1032,13 @@ void OpenTokyoPosition(const datetime now, const double tick,
       else
          GlobalVariableSet(statePrefix + ".tokyo", lastTokyoEntryDate);
       if(GlobalVariableSet(sentPrefix + ".stop", stopDistance) == 0)
-         Print("SL state save failed ticket=", ticket, " error=", GetLastError());
+         Print(gLogIdentity, "event=SL_STATE_SAVE_FAILED message=", "SL state save failed ticket=", ticket, " error=", GetLastError());
       GlobalVariablesFlush();
    }
    // 約定価格を取得する。失敗しても補正待ちの状態は残し、後続ティックで扱う。
    if(!OrderSelect(ticket, SELECT_BY_TICKET))
    {
-      Print("Fill OrderSelect failed ticket=", ticket, " error=", GetLastError());
+      Print(gLogIdentity, "event=FILL_SELECT_FAILED message=", "Fill OrderSelect failed ticket=", ticket, " error=", GetLastError());
       return;
    }
    double target = OrderOpenPrice() + (side == OP_BUY ? -1.0 : 1.0) * stopDistance;
@@ -1059,7 +1073,7 @@ void OpenTokyoPosition(const datetime now, const double tick,
                GlobalVariablesFlush();
             }
          }
-         else Print("SL correction failed ticket=", ticket, " error=", GetLastError());
+         else Print(gLogIdentity, "event=SL_MODIFY_FAILED message=", "SL correction failed ticket=", ticket, " error=", GetLastError());
       }
    }
 }

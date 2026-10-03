@@ -7,7 +7,7 @@
 /*
 売買ロジック
 - En:
-  新バーごとに既存の待機注文を取り消し、確定済み直近En_bars本の最高値へBuy Stop、最安値へSell Stopを同一ロットでOCO発注する。
+  新バーごとに確定済み直近En_bars本の最高値へBuy Stop、最安値へSell Stopを同一ロットでOCO発注する。全条件が一致する既存ペアは保持する。
   片側が約定すると反対側を取り消す。
 - Ex: 
   含み益がATR×HalfATRMultを超えると一度だけ半分を決済する。
@@ -38,6 +38,9 @@
 
 #define MAGIC 20260912
 #define COMMENT "STR01_USDJPY_H1"
+
+// Log identity is cached once; logging does not query orders or consume errors.
+string gLogIdentity = "";
 
 //+------------------------------------------------------------------+
 //| EAパラメータ設定情報                                             |
@@ -76,17 +79,38 @@ bool   gPairRollbackRequired = false;
 bool   gRiskConfigValid = false;
 double order_price,TP,SL;
 string gHalfClosedKeys[];
+datetime gTradeRetryNext = 0;
+bool   gPairSendPending = false;
+datetime gPairSendBar = 0;
+datetime gPairSendStarted = 0;
+datetime gPairSendNext = 0;
+double gPairLots = 0;
+double gPairBuyEntry = 0;
+double gPairBuySL = 0;
+double gPairSellEntry = 0;
+double gPairSellSL = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {  
+
+   // Chart and session distinguish parallel charts and subsequent initializations.
+   gLogIdentity = "ea=" + COMMENT + " symbol=" + Symbol() +
+                  " tf=" + StringSubstr(EnumToString((ENUM_TIMEFRAMES)Period()), 7) +
+                  " magic=" + IntegerToString(MAGIC) +
+                  " chart=" + IntegerToString(ChartID()) +
+                  " session=" + IntegerToString((long)TimeLocal()) + "-" +
+                  IntegerToString((long)GetTickCount()) + " ";
+   Print(gLogIdentity, "event=INIT_BEGIN compiled=", __DATETIME__);
   gBuyStopTicket = -1;
   gSellStopTicket = -1;
   gPendingRecoveryRequired = true;
   gPairRollbackRequired = false;
   gRiskConfigValid = false;
+  gTradeRetryNext = 0;
+  gPairSendPending = false;
   order_price = 0;
   TP = 0;
   SL = 0;
@@ -98,31 +122,32 @@ int OnInit()
   gPipsPoint = Point;
   if(Digits == 3 || Digits == 5) gPipsPoint *= 10.0;
   if(StringSubstr(Symbol(),0,6)!="USDJPY" || Period()!=PERIOD_H1){
-     Print("[STR01_rev] USDJPY H1 is required.");
+     Print(gLogIdentity, "event=INIT_CONTEXT_INVALID message=", "[STR01_rev] USDJPY H1 is required.");
      return(INIT_PARAMETERS_INCORRECT);
   }
   if(En_bars<1 || SL_bars<1 || ATRPeriod<1 || SLLimitPips<=0 ||
      TimeStopBars<1 || ATRShift<0 || ATRShift>1 ||
      HalfATRMult<=0 || TrailATRMult<=0 || MaxOpenPositions<0 ||
      MaxSpreadPips<=0 || Slippage<0){
-     Print("[STR01_rev] Invalid strategy parameter.");
+     Print(gLogIdentity, "event=INIT_PARAMETERS_INVALID message=", "[STR01_rev] Invalid strategy parameter.");
      return(INIT_PARAMETERS_INCORRECT);
   }
   if(EntryRiskPercent<=0 ||
      FreeMarginBufferPercent<0 || FreeMarginBufferPercent>=100){
-     Print("[STR01] Invalid risk parameter. entryRiskPercent=",EntryRiskPercent,
+     Print(gLogIdentity, "event=INIT_RISK_INVALID message=", "[STR01] Invalid risk parameter. entryRiskPercent=",EntryRiskPercent,
            " freeMarginBufferPercent=",FreeMarginBufferPercent);
      return(INIT_PARAMETERS_INCORRECT);
   }
   if(IsTesting()){
      fileHandle = FileOpen("STR01_USDJPY_H1_rev_equity.csv",FILE_WRITE|FILE_CSV|FILE_ANSI,',');
      if(fileHandle==INVALID_HANDLE){
-        Print("[STR01_rev] Cannot open tester equity output. error=",GetLastError());
+        Print(gLogIdentity, "event=EQUITY_OPEN_FAILED message=", "[STR01_rev] Cannot open tester equity output. error=",GetLastError());
         return(INIT_FAILED);
      }
      FileWrite(fileHandle,"time","equity","balance");
   }
   gRiskConfigValid = true;
+   Print(gLogIdentity, "event=INIT_OK");
   return(INIT_SUCCEEDED);
 }
 
@@ -132,7 +157,20 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-  if(gRiskConfigValid) CancelAllPendingOrders(MAGIC);
+  uint deinitStarted=GetTickCount();
+  if(gRiskConfigValid && !CancelAllPendingOrders(MAGIC)){
+     Print(gLogIdentity, "event=DEINIT_CANCEL_INCOMPLETE message=", "[STR01] Deinitialization cancellation incomplete; check remaining pending orders.");
+     // 停止後はtickが来ない。2.5秒の終了制限内で、2秒待った後の一度だけ再試行する。
+     uint retryWaitStarted=GetTickCount();
+     if(MyOrderWaitingTime>=2 && retryWaitStarted-deinitStarted<300){
+        Sleep(2000);
+        if(GetTickCount()-retryWaitStarted>=2000 && GetTickCount()-deinitStarted<2400){
+           gTradeRetryNext=0;
+           if(!CancelAllPendingOrders(MAGIC))
+              Print(gLogIdentity, "event=DEINIT_RETRY_INCOMPLETE message=", "[STR01] Deinitialization retry incomplete; pending orders require recovery.");
+        }
+     }
+  }
   if(fileHandle!=INVALID_HANDLE){
      if(gEquityTick>0) FileWrite(fileHandle,TimeToString(gEquityTick,TIME_DATE|TIME_SECONDS),
                                DoubleToString(gLastEquity,2),DoubleToString(gLastBalance,2));
@@ -144,6 +182,7 @@ void OnDeinit(const int reason)
   gPendingRecoveryRequired = true;
   gPairRollbackRequired = false;
   ArrayResize(gHalfClosedKeys,0);
+   Print(gLogIdentity, "event=DEINIT reason=", reason);
 }
 
 //待機注文数をカウント
@@ -167,7 +206,6 @@ int CountPendingOrders(int magic)
 // 指値注文をすべてキャンセルする関数
 // FREEZELEVEL内の待機注文削除を避け、削除未完了時は新規発注を抑止する
 bool CancelAllPendingOrders(int magic){
-   bool result;
    bool allDeleted = true;
    int totalOrders = OrdersTotal();
    for (int i = totalOrders - 1; i >= 0; i--) {
@@ -185,7 +223,7 @@ bool CancelAllPendingOrders(int magic){
          double pointPrice = MarketInfo(Symbol(),MODE_POINT);
          double freezeLevelPoints = MarketInfo(Symbol(),MODE_FREEZELEVEL);
          if(pointPrice<=0 || freezeLevelPoints<0){
-            Print("[STR01] Invalid symbol property for pending cancellation. ticket=",ticket,
+            Print(gLogIdentity, "event=CANCEL_SYMBOL_INVALID message=", "[STR01] Invalid symbol property for pending cancellation. ticket=",ticket,
                   " point=",pointPrice," freezeLevelPoints=",freezeLevelPoints);
             allDeleted = false;
             continue;
@@ -199,33 +237,25 @@ bool CancelAllPendingOrders(int magic){
          if(type == OP_SELLSTOP) marketDistance = Bid-OrderOpenPrice();
          double freezeDistance = freezeLevelPoints*pointPrice;
          if(marketDistance<=freezeDistance){
-            Print("[STR01] Pending cancellation deferred by FREEZELEVEL. ticket=",ticket,
+            Print(gLogIdentity, "event=CANCEL_FROZEN message=", "[STR01] Pending cancellation deferred by FREEZELEVEL. ticket=",ticket,
                   " type=",type," distance=",marketDistance," freezeDistance=",freezeDistance);
             allDeleted = false;
             continue;
          }
 
-         result = false;
-         // 待機注文をキャンセルする直前で当該注文が執行されたため、OrderDeleteできずに無限ループに陥ってしまう事象を回避
-         int starttime = GetTickCount();
-         while(!result){
-            if(GetTickCount()-starttime > MyOrderWaitingTime*1000){
-               Alert("CancelAllPendingOrders timeout. Check the experts log.");
-               allDeleted = false;
-               break;
-            }
-            // 削除失敗理由を記録し、freezeによる拒否では再試行しない
-            ResetLastError();
-            result = OrderDelete(ticket);
-            if(result){continue;}
+         // 取消要求は一度だけ送信し、失敗時は次のtickへ持ち越す。
+         if(TimeCurrent()<gTradeRetryNext){
+            allDeleted = false;
+            continue;
+         }
+         ResetLastError();
+         if(!OrderDelete(ticket)){
             int deleteError = GetLastError();
-            Print("[STR01] OrderDelete failed. ticket=",ticket," error=",deleteError,
+            Print(gLogIdentity, "event=CANCEL_FAILED message=", "[STR01] OrderDelete failed. ticket=",ticket," error=",deleteError,
                   " ",ErrorDescription(deleteError));
-            if(deleteError==ERR_TRADE_MODIFY_DENIED){
-               allDeleted = false;
-               break;
-            }
-            Sleep(100);
+            if(deleteError==ERR_TOO_FREQUENT_REQUESTS || deleteError==141)
+               gTradeRetryNext = TimeCurrent()+2;
+            allDeleted = false;
          }
       }
    }
@@ -341,11 +371,171 @@ bool PrepareOcoLots(double buyEntry,double buySL,double sellEntry,double sellSL,
       return(false);
    }
 
-   Print("[STR01] OCO lots prepared. entryLots=",entryLots," halfLots=",halfLots,
+   Print(gLogIdentity, "event=OCO_LOTS_PREPARED message=", "[STR01] OCO lots prepared. entryLots=",entryLots," halfLots=",halfLots,
          " buyLossPerLot=",buyLossPerLot," sellLossPerLot=",sellLossPerLot,
          " buyFreeMargin=",buyFreeMargin," sellFreeMargin=",sellFreeMargin,
          " marginBuffer=",marginBuffer);
    return(true);
+}
+
+// 保持中のOCO ticketを確認し、約定時または不完全ペアの反対注文を一度だけ取り消す。
+bool MaintainOcoState(){
+   bool buyPending = false;
+   bool sellPending = false;
+   bool buyFilled = false;
+   bool sellFilled = false;
+   if(gBuyStopTicket>0){
+      if(!OrderSelect(gBuyStopTicket,SELECT_BY_TICKET)) return(false);
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) return(false);
+      if(OrderCloseTime()==0){
+         buyPending = OrderType()==OP_BUYSTOP;
+         buyFilled = OrderType()==OP_BUY;
+      }
+      if(!buyPending && !buyFilled){
+         gPairSendPending=false;
+         gBuyStopTicket=-1;
+      }
+   }
+   if(gSellStopTicket>0){
+      if(!OrderSelect(gSellStopTicket,SELECT_BY_TICKET)) return(false);
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) return(false);
+      if(OrderCloseTime()==0){
+         sellPending = OrderType()==OP_SELLSTOP;
+         sellFilled = OrderType()==OP_SELL;
+      }
+      if(!sellPending && !sellFilled){
+         gPairSendPending=false;
+         gSellStopTicket=-1;
+      }
+   }
+   // 約定を検知した時点で送信待ちを解除する。ticket消去後の買い再送を防ぐ。
+   if(buyFilled || sellFilled) gPairSendPending=false;
+   if(buyFilled && sellFilled){
+      Alert(gLogIdentity, "event=OCO_DOUBLE_FILL message=", "OCO exception: both stop orders were filled. buyTicket=",gBuyStopTicket,
+            " sellTicket=",gSellStopTicket);
+      return(false);
+   }
+   if(!gPairSendPending && buyPending!=sellPending) gPairRollbackRequired=true;
+   if((buyFilled || gPairRollbackRequired) && sellPending){
+      if(TimeCurrent()<gTradeRetryNext) return(false);
+      ResetLastError();
+      if(!OrderDelete(gSellStopTicket)){
+         int err = GetLastError();
+         Print(gLogIdentity, "event=OCO_SELL_CANCEL_FAILED message=", "[STR01] OCO sell cancellation failed. ticket=",gSellStopTicket,
+               " error=",err," ",ErrorDescription(err));
+         if(err==ERR_TOO_FREQUENT_REQUESTS || err==141) gTradeRetryNext=TimeCurrent()+2;
+         return(false);
+      }
+      sellPending = false;
+   }
+   if((sellFilled || gPairRollbackRequired) && buyPending){
+      if(TimeCurrent()<gTradeRetryNext) return(false);
+      ResetLastError();
+      if(!OrderDelete(gBuyStopTicket)){
+         int buyCancelError = GetLastError();
+         Print(gLogIdentity, "event=OCO_BUY_CANCEL_FAILED message=", "[STR01] OCO buy cancellation failed. ticket=",gBuyStopTicket,
+               " error=",buyCancelError," ",ErrorDescription(buyCancelError));
+         if(buyCancelError==ERR_TOO_FREQUENT_REQUESTS || buyCancelError==141) gTradeRetryNext=TimeCurrent()+2;
+         return(false);
+      }
+      buyPending = false;
+   }
+   if((buyFilled && !sellPending) || (sellFilled && !buyPending) ||
+      (gPairRollbackRequired && !buyPending && !sellPending)){
+      gBuyStopTicket = -1;
+      gSellStopTicket = -1;
+      gPairRollbackRequired = false;
+   }
+   return(!gPairRollbackRequired);
+}
+
+// 検証済みの固定payloadを単発送信し、頻度制限時だけtickをまたいで再試行する。
+void ProcessPairSend(){
+   if(!gPairSendPending || gPendingRecoveryRequired || gPairRollbackRequired) return;
+   datetime now = TimeCurrent();
+   if(iTime(NULL,PERIOD_H1,0)!=gPairSendBar || now>gPairSendStarted+(int)MyOrderWaitingTime){
+      gPairSendPending=false;
+      if(gBuyStopTicket>0 || gSellStopTicket>0) gPairRollbackRequired=true;
+      return;
+   }
+   if(now<gPairSendNext || now<gTradeRetryNext) return;
+   if(!IsTradeAllowed() || (!IsTesting() && !IsConnected())) return;
+
+   // 初回成功時だけ同じtickで買い→売りへ進む。失敗時は必ず関数を抜ける。
+   for(int leg=0;leg<2;leg++){
+      if(gBuyStopTicket>0){
+         if(!OrderSelect(gBuyStopTicket,SELECT_BY_TICKET)) return;
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) return;
+         if(OrderCloseTime()!=0 || OrderType()!=OP_BUYSTOP){
+            gPairSendPending=false;
+            return;
+         }
+      }
+      if(gSellStopTicket>0){ gPairSendPending=false; return; }
+      RefreshRates();
+      double tickSizePrice=MarketInfo(Symbol(),MODE_TICKSIZE);
+      double stopPoints=MarketInfo(Symbol(),MODE_STOPLEVEL);
+      double requiredDistance=0;
+      if(tickSizePrice>0 && Point>0 && stopPoints>=0)
+         requiredDistance=MathMax(1.0,MathCeil(stopPoints*Point/tickSizePrice))*tickSizePrice;
+      int openPositions=0;
+      for(int i=OrdersTotal()-1;i>=0;i--){
+         if(!OrderSelect(i,SELECT_BY_POS)) return;
+         if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC &&
+            (OrderType()==OP_BUY || OrderType()==OP_SELL)) openPositions++;
+      }
+      bool safe=Ask>Bid && Ask-Bid<=MaxSpreadPips*gPipsPoint && requiredDistance>0 &&
+                gPairBuyEntry-Ask>=requiredDistance && gPairBuyEntry-gPairBuySL>=requiredDistance &&
+                Bid-gPairSellEntry>=requiredDistance && gPairSellSL-gPairSellEntry>=requiredDistance &&
+                (MaxOpenPositions<=0 || openPositions<MaxOpenPositions);
+      if(safe && now>gPairSendStarted){
+         bool duplicateBuy=false;
+         bool duplicateSell=false;
+         int symbolDigits=(int)MarketInfo(Symbol(),MODE_DIGITS);
+         double tolerance=Point/10.0;
+         if(!FindDuplicatePosition(OP_BUY,gPairBuyEntry,tickSizePrice,symbolDigits,tolerance,duplicateBuy) ||
+            !FindDuplicatePosition(OP_SELL,gPairSellEntry,tickSizePrice,symbolDigits,tolerance,duplicateSell) ||
+            duplicateBuy || duplicateSell) safe=false;
+         double checkedLots=0;
+         string reason="";
+         if(safe && (!PrepareOcoLots(gPairBuyEntry,gPairBuySL,gPairSellEntry,gPairSellSL,checkedLots,reason) ||
+                     MathAbs(checkedLots-gPairLots)>1.0e-8)) safe=false;
+      }
+      if(!safe){
+         gPairSendPending=false;
+         if(gBuyStopTicket>0 || gSellStopTicket>0) gPairRollbackRequired=true;
+         return;
+      }
+      // 走査後にも対象ticketを再選択する。読取失敗・約定済なら反対側を送らない。
+      if(gBuyStopTicket>0){
+         if(!OrderSelect(gBuyStopTicket,SELECT_BY_TICKET)) return;
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) return;
+         if(OrderCloseTime()!=0 || OrderType()!=OP_BUYSTOP){ gPairSendPending=false; return; }
+      }
+      int type=gBuyStopTicket<=0 ? OP_BUYSTOP : OP_SELLSTOP;
+      double price=type==OP_BUYSTOP ? gPairBuyEntry : gPairSellEntry;
+      double stop=type==OP_BUYSTOP ? gPairBuySL : gPairSellSL;
+      ResetLastError();
+      int ticket=OrderSend(Symbol(),type,gPairLots,price,Slippage,stop,0,COMMENT,MAGIC,0,gArrowColor[type]);
+      if(ticket>0){
+         if(type==OP_BUYSTOP) gBuyStopTicket=ticket;
+         else { gSellStopTicket=ticket; gPairSendPending=false; }
+         Print(gLogIdentity, "event=SEND_OK message=", "[STR01] OrderSend result. type=",type," ticket=",ticket);
+         if(!gPairSendPending) return;
+         continue;
+      }
+      int err=GetLastError();
+      Print(gLogIdentity, "event=SEND_FAILED message=", "[STR01] OrderSend result. type=",type," ticket=",ticket," error=",err," ",ErrorDescription(err));
+      if(err==ERR_TOO_FREQUENT_REQUESTS || err==141){
+         gPairSendNext=now+2;
+         gTradeRetryNext=now+2;
+         return;
+      }
+      gPairSendPending=false;
+      if(err==ERR_TRADE_TIMEOUT) gPendingRecoveryRequired=true;
+      if(gBuyStopTicket>0 || gSellStopTicket>0) gPairRollbackRequired=true;
+      return;
+   }
 }
 
 // 注文を識別する文字列を作り、半分決済済みかを確認する
@@ -408,7 +598,7 @@ void CloseHalf(double band,int slippage,int magic){
             double closeLots = NormalizeLotsDown(OrderLots()/2.0,lotStep);
             double remainLots = NormalizeDouble(OrderLots()-closeLots,8);
             if(closeLots<minLots || remainLots<minLots){
-               Print("[STR01] CloseHalf skipped: invalid Buy volume. ticket=",OrderTicket(),
+               Print(gLogIdentity, "event=PARTIAL_BUY_VOLUME_INVALID message=", "[STR01] CloseHalf skipped: invalid Buy volume. ticket=",OrderTicket(),
                      " orderLots=",OrderLots()," closeLots=",closeLots," remainLots=",remainLots);
                continue;
             }
@@ -416,7 +606,7 @@ void CloseHalf(double band,int slippage,int magic){
             starttime = GetTickCount();
             while(!res_cl){
                if(GetTickCount()-starttime > MyOrderWaitingTime*1000){
-                  Alert("CloseHalf timeout. Check the experts log.");
+                  Alert(gLogIdentity, "event=PARTIAL_TIMEOUT message=", "CloseHalf timeout. Check the experts log.");
                   break;
                }
                RefreshRates();
@@ -427,7 +617,7 @@ void CloseHalf(double band,int slippage,int magic){
                   break;
                }
                int closeError = GetLastError();
-               Print("[STR01] CloseHalf Buy failed. ticket=",OrderTicket()," lots=",closeLots,
+               Print(gLogIdentity, "event=PARTIAL_BUY_FAILED message=", "[STR01] CloseHalf Buy failed. ticket=",OrderTicket()," lots=",closeLots,
                      " error=",closeError," ",ErrorDescription(closeError));
                Sleep(100);
             }
@@ -444,7 +634,7 @@ void CloseHalf(double band,int slippage,int magic){
             double sellCloseLots = NormalizeLotsDown(OrderLots()/2.0,sellLotStep);
             double sellRemainLots = NormalizeDouble(OrderLots()-sellCloseLots,8);
             if(sellCloseLots<sellMinLots || sellRemainLots<sellMinLots){
-               Print("[STR01] CloseHalf skipped: invalid Sell volume. ticket=",OrderTicket(),
+               Print(gLogIdentity, "event=PARTIAL_SELL_VOLUME_INVALID message=", "[STR01] CloseHalf skipped: invalid Sell volume. ticket=",OrderTicket(),
                      " orderLots=",OrderLots()," closeLots=",sellCloseLots," remainLots=",sellRemainLots);
                continue;
             }
@@ -452,7 +642,7 @@ void CloseHalf(double band,int slippage,int magic){
             starttime = GetTickCount();
             while(!res_cl){
                if(GetTickCount()-starttime > MyOrderWaitingTime*1000){
-                  Alert("CloseHalf timeout. Check the experts log.");
+                  Alert(gLogIdentity, "event=PARTIAL_TIMEOUT message=", "CloseHalf timeout. Check the experts log.");
                   break;
                }               
                RefreshRates();
@@ -463,7 +653,7 @@ void CloseHalf(double band,int slippage,int magic){
                   break;
                }
                int sellCloseError = GetLastError();
-               Print("[STR01] CloseHalf Sell failed. ticket=",OrderTicket()," lots=",sellCloseLots,
+               Print(gLogIdentity, "event=PARTIAL_SELL_FAILED message=", "[STR01] CloseHalf Sell failed. ticket=",OrderTicket()," lots=",sellCloseLots,
                      " error=",sellCloseError," ",ErrorDescription(sellCloseError));
                Sleep(100);
             }
@@ -492,23 +682,22 @@ void OnTick()
       }
    }
 
-   bool ocoReady = ApplyOCO(Symbol(),MAGIC,gBuyStopTicket,gSellStopTicket,
-                            gPairRollbackRequired,MyOrderWaitingTime);
+   bool ocoReady = MaintainOcoState();
+   if(ocoReady && recoveryReady && !gPendingRecoveryRequired && !gPairRollbackRequired) ProcessPairSend();
    bool newBar = IsNewBar();
    if(IsTesting() && newBar && gEquityTick>0 &&
       (long)TimeCurrent()/86400!=(long)gEquityTick/86400){
       FileWrite(fileHandle,TimeToString(gEquityTick,TIME_DATE|TIME_SECONDS),
                 DoubleToString(gLastEquity,2),DoubleToString(gLastBalance,2));
    }
-   int oTicket;
    int TPPoints;
    
    if(newBar==True){
-      //既存の待機注文をキャンセル
-      // 既存の待機注文をすべて取り消した後に限り、新しい待機注文を配置する
+      // 新バーの全条件を再評価し、同条件のペアを保持する。置換時は取消完了を必須とする。
       bool canPlaceOrders = false;
-      if(recoveryReady) canPlaceOrders = CancelAllPendingOrders(MAGIC);
-      if(!ocoReady || gPendingRecoveryRequired) canPlaceOrders = false;
+      if(recoveryReady) canPlaceOrders = true;
+      if(!ocoReady || gPendingRecoveryRequired || gPairRollbackRequired || gPairSendPending)
+         canPlaceOrders = false;
       int openPositions = 0;
       for(int positionIndex=OrdersTotal()-1;positionIndex>=0;positionIndex--){
          if(!OrderSelect(positionIndex,SELECT_BY_POS)){
@@ -522,10 +711,10 @@ void OnTick()
       RefreshRates();
       if(Ask-Bid>MaxSpreadPips*gPipsPoint ||
          Bars<=MathMax(MathMax(En_bars,SL_bars),ATRPeriod+ATRShift)+1) canPlaceOrders = false;
+      if(!canPlaceOrders && recoveryReady && !CancelAllPendingOrders(MAGIC))
+         gPendingRecoveryRequired=true;
       // 価格刻みに合わせた値で、市場価格・待機注文価格・損切り価格の必要距離を確認する
       if(canPlaceOrders){
-         gBuyStopTicket = -1;
-         gSellStopTicket = -1;
          RefreshRates();
          double pointPrice = MarketInfo(Symbol(),MODE_POINT);
          int symbolDigits = (int)MarketInfo(Symbol(),MODE_DIGITS);
@@ -583,84 +772,124 @@ void OnTick()
             if(pairReady && !PrepareOcoLots(alignedBuyEntry,alignedBuySL,alignedSellEntry,alignedSellSL,
                                              entryLots,lotRejectReason)){
                pairReady = false;
-               Print("[STR01] OCO pair skipped by lot/risk check. reason=",lotRejectReason,
+               Print(gLogIdentity, "event=OCO_RISK_REJECTED message=", "[STR01] OCO pair skipped by lot/risk check. reason=",lotRejectReason,
                      " buyEntry=",alignedBuyEntry," buySL=",alignedBuySL,
                      " sellEntry=",alignedSellEntry," sellSL=",alignedSellSL);
             }
 
+            // 検証済みpayloadと完全一致する健全なOCOペアだけは取消・再発注せず保持する。
+            bool keepExistingPair = false;
+            int existingBuyTicket = -1;
+            int existingSellTicket = -1;
+            int existingPendingCount = 0;
             if(pairReady){
-               TP = 0;
-               order_price = alignedBuyEntry;
-               SL = alignedBuySL;
-               Print("[STR01] OrderSend request. type=",OP_BUYSTOP," entry=",order_price,
-                     " sl=",SL," bid=",marketBid," ask=",marketAsk," stopLevelPoints=",stopLevelPoints,
-                     " freezeLevelPoints=",MarketInfo(Symbol(),MODE_FREEZELEVEL)," tickSizePoints=",tickSizePoints);
-               oTicket = SendOrder(OP_BUYSTOP,entryLots,order_price,Slippage,SL,TP,COMMENT,MAGIC);
-               if(oTicket>0) gBuyStopTicket = oTicket;
-               Print("[STR01] OrderSend result. type=",OP_BUYSTOP," ticket=",oTicket);
-
-               // 買いの逆指値注文が受け付けられた場合だけ、検証済みの売り逆指値注文を送信する
-               // 片側だけの取引機会を残すことより、対になる注文を確実に成立させることを優先する
-               if(gBuyStopTicket>0){
-                  order_price = alignedSellEntry;
-                  SL = alignedSellSL;
-                  Print("[STR01] OrderSend request. type=",OP_SELLSTOP," entry=",order_price,
-                        " sl=",SL," bid=",marketBid," ask=",marketAsk," stopLevelPoints=",stopLevelPoints,
-                        " freezeLevelPoints=",MarketInfo(Symbol(),MODE_FREEZELEVEL)," tickSizePoints=",tickSizePoints);
-                  oTicket = SendOrder(OP_SELLSTOP,entryLots,order_price,Slippage,SL,TP,COMMENT,MAGIC);
-                  if(oTicket>0) gSellStopTicket = oTicket;
-                  Print("[STR01] OrderSend result. type=",OP_SELLSTOP," ticket=",oTicket);
+               keepExistingPair = true;
+               for(int pendingIndex=OrdersTotal()-1;pendingIndex>=0;pendingIndex--){
+                  if(!OrderSelect(pendingIndex,SELECT_BY_POS)){
+                     keepExistingPair = false;
+                     break;
+                  }
+                  if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+                  int pendingType = OrderType();
+                  if(pendingType!=OP_BUYSTOP && pendingType!=OP_SELLSTOP &&
+                     pendingType!=OP_BUYLIMIT && pendingType!=OP_SELLLIMIT) continue;
+                  existingPendingCount++;
+                  bool commonMatch = MathAbs(OrderLots()-entryLots)<=1.0e-8 &&
+                                     MathAbs(OrderTakeProfit())<=tickTolerance &&
+                                     OrderExpiration()==0;
+                  if(pendingType==OP_BUYSTOP && existingBuyTicket<0 && commonMatch &&
+                     MathAbs(OrderOpenPrice()-alignedBuyEntry)<=tickTolerance &&
+                     MathAbs(OrderStopLoss()-alignedBuySL)<=tickTolerance)
+                     existingBuyTicket=OrderTicket();
+                  else if(pendingType==OP_SELLSTOP && existingSellTicket<0 && commonMatch &&
+                          MathAbs(OrderOpenPrice()-alignedSellEntry)<=tickTolerance &&
+                          MathAbs(OrderStopLoss()-alignedSellSL)<=tickTolerance)
+                     existingSellTicket=OrderTicket();
+                  else keepExistingPair=false;
                }
+               keepExistingPair = keepExistingPair && existingPendingCount==2 &&
+                                  existingBuyTicket>0 && existingSellTicket>0;
+            }
+            if(keepExistingPair){
+               gBuyStopTicket=existingBuyTicket;
+               gSellStopTicket=existingSellTicket;
+               Print(gLogIdentity, "event=OCO_RETAINED message=", "[STR01] Existing OCO pair retained. buyTicket=",gBuyStopTicket,
+                     " sellTicket=",gSellStopTicket);
+            }
+            else{
+               bool pendingCleared = CancelAllPendingOrders(MAGIC);
+               if(!pendingCleared){
+                  pairReady=false;
+                  gPendingRecoveryRequired=true;
+               }
+               else{
+                  gBuyStopTicket=-1;
+                  gSellStopTicket=-1;
+               }
+            }
+
+            if(pairReady && !keepExistingPair){
+               TP = 0;
+               gPairLots=entryLots;
+               gPairBuyEntry=alignedBuyEntry;
+               gPairBuySL=alignedBuySL;
+               gPairSellEntry=alignedSellEntry;
+               gPairSellSL=alignedSellSL;
+               gPairSendBar=iTime(NULL,PERIOD_H1,0);
+               gPairSendStarted=TimeCurrent();
+               gPairSendNext=TimeCurrent();
+               gPairSendPending=true;
+               ProcessPairSend();
             }
             else{
                // ペアの一方でも不成立なら、両方の注文を見送る
                if(!buyPricesOnTickGrid){
-                  Print("[STR01] OCO pair skipped: Buy Stop price is off tick grid. entry=",buyEntry,
+                  Print(gLogIdentity, "event=BUY_TICK_GRID_INVALID message=", "[STR01] OCO pair skipped: Buy Stop price is off tick grid. entry=",buyEntry,
                         " sl=",buySL," tickSizePrice=",tickSizePrice);
                }
                if(!sellPricesOnTickGrid){
-                  Print("[STR01] OCO pair skipped: Sell Stop price is off tick grid. entry=",sellEntry,
+                  Print(gLogIdentity, "event=SELL_TICK_GRID_INVALID message=", "[STR01] OCO pair skipped: Sell Stop price is off tick grid. entry=",sellEntry,
                         " sl=",sellSL," tickSizePrice=",tickSizePrice);
                }
                if(!duplicateScanReady){
-                  Print("[STR01] OCO pair skipped: duplicate-price scan failed.");
+                  Print(gLogIdentity, "event=DUPLICATE_SCAN_FAILED message=", "[STR01] OCO pair skipped: duplicate-price scan failed.");
                }
                else if(duplicateBuyEntry || duplicateSellEntry){
-                  Print("[STR01] OCO pair skipped: same-price position exists. buyDuplicate=",
+                  Print(gLogIdentity, "event=DUPLICATE_FOUND message=", "[STR01] OCO pair skipped: same-price position exists. buyDuplicate=",
                         duplicateBuyEntry," sellDuplicate=",duplicateSellEntry);
                }
                if(!buyDistanceValid){
-                  Print("[STR01] OCO pair skipped: Buy Stop distance condition failed. entryMarketDistance=",
+                  Print(gLogIdentity, "event=BUY_DISTANCE_INVALID message=", "[STR01] OCO pair skipped: Buy Stop distance condition failed. entryMarketDistance=",
                         alignedBuyEntry-marketAsk," entrySLDistance=",alignedBuyEntry-alignedBuySL,
                         " requiredStopDistance=",requiredStopDistance);
                }
                if(!sellDistanceValid){
-                  Print("[STR01] OCO pair skipped: Sell Stop distance condition failed. entryMarketDistance=",
+                  Print(gLogIdentity, "event=SELL_DISTANCE_INVALID message=", "[STR01] OCO pair skipped: Sell Stop distance condition failed. entryMarketDistance=",
                         marketBid-alignedSellEntry," entrySLDistance=",alignedSellSL-alignedSellEntry,
                         " requiredStopDistance=",requiredStopDistance);
                }
             }
          }
          else{
-            Print("[STR01] Pending orders skipped: invalid symbol property. point=",pointPrice,
+            Print(gLogIdentity, "event=ENTRY_SYMBOL_INVALID message=", "[STR01] Pending orders skipped: invalid symbol property. point=",pointPrice,
                   " digits=",symbolDigits," tickSizePoints=",tickSizePoints,
                   " stopLevelPoints=",stopLevelPoints);
+            if(!CancelAllPendingOrders(MAGIC)) gPendingRecoveryRequired=true;
          }
 
          // 片側だけが発注された場合は、対になる注文がない待機注文を取り消す
-         if((gBuyStopTicket>0 && gSellStopTicket<=0) ||
-            (gSellStopTicket>0 && gBuyStopTicket<=0)){
+         if(!gPairSendPending && ((gBuyStopTicket>0 && gSellStopTicket<=0) ||
+            (gSellStopTicket>0 && gBuyStopTicket<=0))){
             gPairRollbackRequired = true;
-            Print("[STR01] Incomplete OCO pair. Rolling back the unpaired pending order. buyTicket=",
+            Print(gLogIdentity, "event=OCO_ROLLBACK message=", "[STR01] Incomplete OCO pair. Rolling back the unpaired pending order. buyTicket=",
                   gBuyStopTicket," sellTicket=",gSellStopTicket);
          }
       }
    }
 
    // 発注処理中に即時約定した場合も、同じ価格更新内で検知する
-   if(!ApplyOCO(Symbol(),MAGIC,gBuyStopTicket,gSellStopTicket,
-                gPairRollbackRequired,MyOrderWaitingTime)){
-      Print("[STR01] OCO is not complete. New entries will remain blocked until the state is resolved.");
+   if(!MaintainOcoState()){
+      Print(gLogIdentity, "event=OCO_UNRESOLVED message=", "[STR01] OCO is not complete. New entries will remain blocked until the state is resolved.");
    }
     
    double exitATR = iATR(NULL,PERIOD_H1,ATRPeriod,ATRShift);
@@ -675,7 +904,7 @@ void OnTick()
       for(int trailIndex=OrdersTotal()-1;trailIndex>=0;trailIndex--){
          ResetLastError();
          if(!OrderSelect(trailIndex,SELECT_BY_POS)){
-            Print("[STR01_rev] Trailing selection failed. error=",GetLastError());
+            Print(gLogIdentity, "event=TRAIL_SELECT_FAILED message=", "[STR01_rev] Trailing selection failed. error=",GetLastError());
             continue;
          }
          int trailType = OrderType();
@@ -707,7 +936,7 @@ void OnTick()
          ResetLastError();
          if(!OrderModify(OrderTicket(),OrderOpenPrice(),newStop,OrderTakeProfit(),0,gArrowColor[trailType])){
             int modifyError = GetLastError();
-            Print("[STR01_rev] Trailing modify failed. ticket=",OrderTicket(),
+            Print(gLogIdentity, "event=TRAIL_MODIFY_FAILED message=", "[STR01_rev] Trailing modify failed. ticket=",OrderTicket(),
                   " error=",modifyError," ",ErrorDescription(modifyError));
          }
       }
@@ -715,7 +944,7 @@ void OnTick()
    for(int timeIndex=OrdersTotal()-1;timeIndex>=0;timeIndex--){
       ResetLastError();
       if(!OrderSelect(timeIndex,SELECT_BY_POS)){
-         Print("[STR01_rev] Time-stop selection failed. error=",GetLastError());
+         Print(gLogIdentity, "event=TIME_STOP_SELECT_FAILED message=", "[STR01_rev] Time-stop selection failed. error=",GetLastError());
          continue;
       }
       int timeType = OrderType();
@@ -734,7 +963,7 @@ void OnTick()
       ResetLastError();
       if(!OrderClose(OrderTicket(),OrderLots(),closePrice,Slippage,gArrowColor[timeType])){
          int timeCloseError = GetLastError();
-         Print("[STR01_rev] Time-stop close failed. ticket=",OrderTicket(),
+         Print(gLogIdentity, "event=TIME_STOP_CLOSE_FAILED message=", "[STR01_rev] Time-stop close failed. ticket=",OrderTicket(),
                " error=",timeCloseError," ",ErrorDescription(timeCloseError));
       }
    }

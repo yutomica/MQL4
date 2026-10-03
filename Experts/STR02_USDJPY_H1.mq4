@@ -40,6 +40,9 @@
 #define MAGIC 20260913
 #define COMMENT "STR02_USDJPY_H1"
 
+// Log identity is cached once; logging does not query orders or consume errors.
+string gLogIdentity = "";
+
 //+------------------------------------------------------------------+
 //| ストラテジーパラメータ                                         |
 //+------------------------------------------------------------------+
@@ -64,12 +67,33 @@ bool     stateHealthy = true;
 string   exitPrefix  = "";
 int      exitTickets[];
 datetime exitRetryTimes[];
+bool     entryRetryPending = false;
+datetime entryRetryBar = 0;
+datetime entryRetryStarted = 0;
+datetime entryRetryNext = 0;
+int      entryRetryCmd = -1;
+int      entryRetrySide = -1;
+double   entryRetryLots = 0;
+double   entryRetryPrice = 0;
+double   entryRetryStop = 0;
+double   entryRetryATR = 0;
+datetime entryRetryExpiration = 0;
 
 //+------------------------------------------------------------------+
 //| EA初期化                                                        |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+
+   // Chart and session distinguish parallel charts and subsequent initializations.
+   gLogIdentity = "ea=" + COMMENT + " symbol=" + Symbol() +
+                  " tf=" + StringSubstr(EnumToString((ENUM_TIMEFRAMES)Period()), 7) +
+                  " magic=" + IntegerToString(MAGIC) +
+                  " chart=" + IntegerToString(ChartID()) +
+                  " session=" + IntegerToString((long)TimeLocal()) + "-" +
+                  IntegerToString((long)GetTickCount()) + " ";
+   Print(gLogIdentity, "event=INIT_BEGIN compiled=", __DATETIME__);
+   entryRetryPending = false;
    if(Period() != PERIOD_H1 || TradeSymbol != "USDJPY" ||
       StringSubstr(Symbol(),0,6) != TradeSymbol)
       return(INIT_PARAMETERS_INCORRECT);
@@ -99,12 +123,13 @@ int OnInit()
          return(INIT_FAILED);
       FileWrite(equityFile, "time", "equity", "balance");
    }
-   Print("SPEC currency=", AccountCurrency(), " capital=", AccountBalance(),
+   Print(gLogIdentity, "event=SYMBOL_SPEC message=", "SPEC currency=", AccountCurrency(), " capital=", AccountBalance(),
          " tick_size=", MarketInfo(Symbol(), MODE_TICKSIZE),
          " tick_value=", MarketInfo(Symbol(), MODE_TICKVALUE),
          " min_lot=", MarketInfo(Symbol(), MODE_MINLOT),
          " lot_step=", MarketInfo(Symbol(), MODE_LOTSTEP),
          " spread=", MarketInfo(Symbol(), MODE_SPREAD));
+   Print(gLogIdentity, "event=INIT_OK");
    return(INIT_SUCCEEDED);
 }
 
@@ -122,6 +147,7 @@ void OnDeinit(const int reason)
                    DoubleToString(AccountBalance(), 2));
       FileClose(equityFile);
    }
+   Print(gLogIdentity, "event=DEINIT reason=", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -158,7 +184,7 @@ void OnTick()
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
       {
-         Print("OrderSelect failed ", GetLastError());
+         Print(gLogIdentity, "event=ORDER_SELECT_FAILED message=", "OrderSelect failed ", GetLastError());
          return;
       }
       if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC)
@@ -186,7 +212,7 @@ void OnTick()
             ArrayResize(exitTickets, pendingIndex + 1) != pendingIndex + 1)
          {
             stateHealthy = false;
-            Alert("STR02: cannot retain exit request; new entries blocked. ticket=", ticket);
+            Alert(gLogIdentity, "event=EXIT_REQUEST_RETAIN_FAILED message=", "STR02: cannot retain exit request; new entries blocked. ticket=", ticket);
             return;
          }
          exitTickets[pendingIndex] = ticket;
@@ -200,7 +226,7 @@ void OnTick()
          if(GlobalVariableSet(exitKey, 1.0) == 0)
          {
             stateHealthy = false;
-            Alert("STR02: exit state save failed; new entries blocked. ticket=", ticket,
+            Alert(gLogIdentity, "event=EXIT_STATE_SAVE_FAILED message=", "STR02: exit state save failed; new entries blocked. ticket=", ticket,
                   " error=", GetLastError());
          }
          else
@@ -214,7 +240,7 @@ void OnTick()
       // 再試行直前にチケットを再選択し、SL約定・手動決済済みの注文を再送しない。
       if(!OrderSelect(ticket, SELECT_BY_TICKET))
       {
-         Print("Exit OrderSelect failed ticket=", ticket, " error=", GetLastError());
+         Print(gLogIdentity, "event=EXIT_SELECT_FAILED message=", "Exit OrderSelect failed ticket=", ticket, " error=", GetLastError());
          continue;
       }
       if(OrderCloseTime() != 0 || OrderSymbol() != Symbol() ||
@@ -229,7 +255,7 @@ void OnTick()
          continue;
       ResetLastError();
       if(!OrderClose(ticket, OrderLots(), price, slippage, clrNONE))
-         Print("Exit failed ticket=", ticket, " error=", GetLastError(), "; retry after >=5 seconds");
+         Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", ticket, " error=", GetLastError(), "; retry after >=5 seconds");
       else
       {
          exitTickets[pendingIndex] = exitTickets[ArraySize(exitTickets) - 1];
@@ -239,15 +265,82 @@ void OnTick()
          if(!IsTesting() && GlobalVariableCheck(exitKey))
          {
             if(!GlobalVariableDel(exitKey))
-               Print("Exit state cleanup failed ticket=", ticket, " error=", GetLastError());
+               Print(gLogIdentity, "event=EXIT_STATE_CLEANUP_FAILED message=", "Exit state cleanup failed ticket=", ticket, " error=", GetLastError());
             GlobalVariablesFlush();
          }
       }
    }
+   // 頻度制限で拒否された指値だけを、最初に検証した内容のまま同じH1バー内で再送する。
+   if(entryRetryPending)
+   {
+      if(!historyReady || !AllowNewEntries || !stateHealthy || occupied || bar != entryRetryBar || now > entryRetryStarted + 5 ||
+         now >= entryRetryExpiration)
+      {
+         entryRetryPending = false;
+      }
+      else if(now >= entryRetryNext)
+      {
+         // 再送直前にも初回と同じ安全条件を確認する。価格、SL、数量は再計算しない。
+         if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()))
+            entryRetryNext = now + 2;
+         else
+         {
+            RefreshRates();
+            double retryTick = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
+            double retryStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+            double retryMinDistance = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + retryTick;
+            double retryCapital = MathMin(AccountBalance(), AccountEquity());
+            bool retryValid = (Bid > 0 && Ask > Bid && retryTick > 0 && retryStep > 0 &&
+                               Ask - Bid <= MaxSpreadPips * pip &&
+                               (MinATRSpreadRatio <= 0 || entryRetryATR >= MinATRSpreadRatio * (Ask - Bid)) &&
+                               entryRetryLots >= MarketInfo(Symbol(), MODE_MINLOT) &&
+                               entryRetryLots <= MarketInfo(Symbol(), MODE_MAXLOT) &&
+                               MathAbs(entryRetryLots / retryStep - MathRound(entryRetryLots / retryStep)) <= 1.0e-8);
+            if(entryRetrySide == OP_BUY)
+               retryValid = retryValid && Ask - entryRetryPrice >= retryMinDistance &&
+                            entryRetryPrice - entryRetryStop >= retryMinDistance;
+            else
+               retryValid = retryValid && entryRetryPrice - Bid >= retryMinDistance &&
+                            entryRetryStop - entryRetryPrice >= retryMinDistance;
+            ResetLastError();
+            double retryFreeAfter = retryValid ? AccountFreeMarginCheck(Symbol(), entryRetrySide,
+                                                                         entryRetryLots) : -1;
+            int retryMarginError = GetLastError();
+            retryValid = retryValid && retryMarginError == 0 &&
+                         retryFreeAfter >= 0.3 * retryCapital;
+            if(!retryValid)
+            {
+               Print(gLogIdentity, "event=ENTRY_RETRY_CANCELLED message=", "Entry retry cancelled: current safety condition failed.");
+               entryRetryPending = false;
+            }
+            else
+            {
+               ResetLastError();
+               int retryTicket = OrderSend(Symbol(), entryRetryCmd, entryRetryLots,
+                                           entryRetryPrice, slippage, entryRetryStop, 0,
+                                           COMMENT, MAGIC, entryRetryExpiration, clrNONE);
+               if(retryTicket >= 0)
+               {
+                  Print(gLogIdentity, "event=ENTRY_RETRY_OK message=", "Pending entry retry succeeded ticket=", retryTicket);
+                  entryRetryPending = false;
+               }
+               else
+               {
+                  int retryError = GetLastError();
+                  Print(gLogIdentity, "event=ENTRY_RETRY_FAILED message=", "Entry retry failed error=", retryError);
+                  if(retryError == 8 || retryError == 141)
+                     entryRetryNext = now + 2;
+                  else
+                     entryRetryPending = false;
+               }
+            }
+         }
+      }
+   }
    // このEAのポジションがある場合、そのバーでは新規エントリーしない。決済したバーも再発注しない。
-   if(occupied || !newBar || !historyReady || !AllowNewEntries || !stateHealthy)
+   if(entryRetryPending || occupied || !newBar || !historyReady || !AllowNewEntries || !stateHealthy)
       return;
-   // 新規注文の失敗は同じバーで再送しない。タイムアウト時の二重発注を避ける。
+   // 初回発注は新バーのみ。指値の8/141以外の失敗は再送せず、二重発注を避ける。
    if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()))
       return;
    RefreshRates();
@@ -319,12 +412,30 @@ void OnTick()
    if(GetLastError() != 0 || freeAfter < 0.3 * capital)
       return;
    // ATR初期SLを付け、TPなしの成行または期限付き指値注文を送信する。
+   ResetLastError();
    int ticket = OrderSend(Symbol(), orderCmd, lots, entry, slippage, stop, 0,
                           COMMENT, MAGIC, expiration, clrNONE);
    if(ticket < 0)
-      Print("Entry failed error=", GetLastError());
+   {
+      int entryError = GetLastError();
+      Print(gLogIdentity, "event=ENTRY_FAILED message=", "Entry failed error=", entryError);
+      if(EntryPullbackATR > 0 && (entryError == 8 || entryError == 141))
+      {
+         entryRetryPending = true;
+         entryRetryBar = bar;
+         entryRetryStarted = now;
+         entryRetryNext = now + 2;
+         entryRetryCmd = orderCmd;
+         entryRetrySide = side;
+         entryRetryLots = lots;
+         entryRetryPrice = entry;
+         entryRetryStop = stop;
+         entryRetryATR = atr;
+         entryRetryExpiration = expiration;
+      }
+   }
    else if(EntryPullbackATR > 0)
-      Print("Pending entry ticket=", ticket, " side=", (side == OP_BUY ? "BUY" : "SELL"),
+      Print(gLogIdentity, "event=ENTRY_PENDING message=", "Pending entry ticket=", ticket, " side=", (side == OP_BUY ? "BUY" : "SELL"),
             " entryATR=", DoubleToString(atr, Digits),
             " limit=", DoubleToString(entry, Digits),
             " expiration=", TimeToString(expiration, TIME_DATE | TIME_SECONDS));
