@@ -2,3 +2,18 @@ Experts/*.ex4
 .vscode/
 Logs/*
 **/mqlcache.dat
+
+# MT4のキャッシュ・生成物
+mqlcache*.dat
+*.log
+*.hst
+*.fxt
+
+# 実行時の一時ファイル
+/Logs/
+/Files/_tmp.csv
+
+# ローカル作業用
+/.vscode/
+/.codex_backups/
+/token.txt  
