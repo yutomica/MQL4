@@ -38,6 +38,8 @@
 
 #property strict
 
+#include <Original/Mail.mqh>
+
 #define MAGIC 20260926
 #define COMMENT "STR03_USDJPY_M30"
 
@@ -1014,6 +1016,9 @@ void OpenTokyoPosition(const datetime now, const double tick,
       }
       return;
    }
+   if(OrderSelect(ticket,SELECT_BY_TICKET) &&
+      (OrderType()==OP_BUY || OrderType()==OP_SELL))
+      MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
    // 発注成功後にだけ、保有チケット、固定SL幅、当日の売買実績を更新する。
    stopTicket = ticket;
    stopDistance = StopATR * atr;

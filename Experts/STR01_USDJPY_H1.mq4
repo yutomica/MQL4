@@ -41,6 +41,7 @@
 
 // Log identity is cached once; logging does not query orders or consume errors.
 string gLogIdentity = "";
+int gEntryMailTickets[]; // 約定通知待ちの注文ticket
 
 //+------------------------------------------------------------------+
 //| EAパラメータ設定情報                                             |
@@ -147,6 +148,17 @@ int OnInit()
      FileWrite(fileHandle,"time","equity","balance");
   }
   gRiskConfigValid = true;
+   // 起動時に残っている待機注文も、約定後だけ通知する。
+   ArrayResize(gEntryMailTickets,0);
+   for(int mailIndex=OrdersTotal()-1; mailIndex>=0; mailIndex--)
+   {
+      if(!OrderSelect(mailIndex,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC ||
+         OrderType()<OP_BUYLIMIT || OrderType()>OP_SELLSTOP) continue;
+      int mailCount=ArraySize(gEntryMailTickets);
+      if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
+         gEntryMailTickets[mailCount]=OrderTicket();
+   }
    Print(gLogIdentity, "event=INIT_OK");
   return(INIT_SUCCEEDED);
 }
@@ -521,6 +533,9 @@ void ProcessPairSend(){
          if(type==OP_BUYSTOP) gBuyStopTicket=ticket;
          else { gSellStopTicket=ticket; gPairSendPending=false; }
          Print(gLogIdentity, "event=SEND_OK message=", "[STR01] OrderSend result. type=",type," ticket=",ticket);
+         int mailCount=ArraySize(gEntryMailTickets);
+         if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
+            gEntryMailTickets[mailCount]=ticket;
          if(!gPairSendPending) return;
          continue;
       }
@@ -669,6 +684,22 @@ void CloseHalf(double band,int slippage,int magic){
 //+------------------------------------------------------------------+
 void OnTick()
 {  
+   // 待機注文がBuy/Sellに変わった時だけ通知し、処理済みticketを外す。
+   for(int mailIndex=ArraySize(gEntryMailTickets)-1; mailIndex>=0; mailIndex--)
+   {
+      if(!OrderSelect(gEntryMailTickets[mailIndex],SELECT_BY_TICKET)) continue;
+      if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC)
+      {
+         if(OrderType()==OP_BUY || OrderType()==OP_SELL)
+            MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
+         else if(OrderCloseTime()==0)
+            continue;
+      }
+      // 取消・期限切れは通知しない。約定後すぐ決済されたticketも上で確認する。
+      int mailLast=ArraySize(gEntryMailTickets)-1;
+      gEntryMailTickets[mailIndex]=gEntryMailTickets[mailLast];
+      ArrayResize(gEntryMailTickets,mailLast);
+   }
    if(!gRiskConfigValid) return;
    // 再初期化後は以前の注文番号を推測せず、すべての待機注文が取り消されるまで毎回確認する
    bool recoveryReady = true;

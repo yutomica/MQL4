@@ -35,6 +35,8 @@
 */
 
 #property strict
+
+#include <Original/Mail.mqh>
 #property description "H1 RSI(2) EMA(200)方向押し目・戻り売り。USDJPY H1実運用対応版。"
 
 #define MAGIC 20260913
@@ -42,6 +44,7 @@
 
 // Log identity is cached once; logging does not query orders or consume errors.
 string gLogIdentity = "";
+int gEntryMailTickets[]; // 約定通知待ちの注文ticket
 
 //+------------------------------------------------------------------+
 //| ストラテジーパラメータ                                         |
@@ -129,6 +132,17 @@ int OnInit()
          " min_lot=", MarketInfo(Symbol(), MODE_MINLOT),
          " lot_step=", MarketInfo(Symbol(), MODE_LOTSTEP),
          " spread=", MarketInfo(Symbol(), MODE_SPREAD));
+   // 起動時に残っている待機注文も、約定後だけ通知する。
+   ArrayResize(gEntryMailTickets,0);
+   for(int mailIndex=OrdersTotal()-1; mailIndex>=0; mailIndex--)
+   {
+      if(!OrderSelect(mailIndex,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC ||
+         OrderType()<OP_BUYLIMIT || OrderType()>OP_SELLSTOP) continue;
+      int mailCount=ArraySize(gEntryMailTickets);
+      if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
+         gEntryMailTickets[mailCount]=OrderTicket();
+   }
    Print(gLogIdentity, "event=INIT_OK");
    return(INIT_SUCCEEDED);
 }
@@ -155,6 +169,22 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // 待機注文がBuy/Sellに変わった時だけ通知し、処理済みticketを外す。
+   for(int mailIndex=ArraySize(gEntryMailTickets)-1; mailIndex>=0; mailIndex--)
+   {
+      if(!OrderSelect(gEntryMailTickets[mailIndex],SELECT_BY_TICKET)) continue;
+      if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC)
+      {
+         if(OrderType()==OP_BUY || OrderType()==OP_SELL)
+            MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
+         else if(OrderCloseTime()==0)
+            continue;
+      }
+      // 取消・期限切れは通知しない。約定後すぐ決済されたticketも上で確認する。
+      int mailLast=ArraySize(gEntryMailTickets)-1;
+      gEntryMailTickets[mailIndex]=gEntryMailTickets[mailLast];
+      ArrayResize(gEntryMailTickets,mailLast);
+   }
    datetime now=TimeCurrent();
 
    // サーバー時刻の日付が変わったら、直前の日の最後の観測値を記録する。
@@ -323,6 +353,9 @@ void OnTick()
                {
                   Print(gLogIdentity, "event=ENTRY_RETRY_OK message=", "Pending entry retry succeeded ticket=", retryTicket);
                   entryRetryPending = false;
+                  int mailCount=ArraySize(gEntryMailTickets);
+                  if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
+                     gEntryMailTickets[mailCount]=retryTicket;
                }
                else
                {
@@ -439,4 +472,16 @@ void OnTick()
             " entryATR=", DoubleToString(atr, Digits),
             " limit=", DoubleToString(entry, Digits),
             " expiration=", TimeToString(expiration, TIME_DATE | TIME_SECONDS));
+   if(ticket >= 0)
+   {
+      if(OrderSelect(ticket,SELECT_BY_TICKET) &&
+         (OrderType()==OP_BUY || OrderType()==OP_SELL))
+         MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
+      else
+      {
+         int mailCount=ArraySize(gEntryMailTickets);
+         if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
+            gEntryMailTickets[mailCount]=ticket;
+      }
+   }
 }
