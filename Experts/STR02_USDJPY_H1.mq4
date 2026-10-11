@@ -37,6 +37,7 @@
 #property strict
 
 #include <Original/Mail.mqh>
+#include <Original/TradeControl.mqh>
 #property description "H1 RSI(2) EMA(200)方向押し目・戻り売り。USDJPY H1実運用対応版。"
 
 #define MAGIC 20260913
@@ -70,6 +71,10 @@ bool     stateHealthy = true;
 string   exitPrefix  = "";
 int      exitTickets[];
 datetime exitRetryTimes[];
+bool     gReleasePending = false;
+string   gSendKey = "";
+double   gSendNumber = 0;
+bool     gSendHandled = false;
 bool     entryRetryPending = false;
 datetime entryRetryBar = 0;
 datetime entryRetryStarted = 0;
@@ -107,6 +112,9 @@ int OnInit()
       MaxSpreadPips <= 0 || MinATRSpreadRatio < 0 || MAGIC <= 0)
       return(INIT_PARAMETERS_INCORRECT);
 
+   if(!TC_Init(2000)) return(INIT_FAILED);
+   gReleasePending = false;
+
    // サーバー・銘柄をハッシュ化し、保存キーを63文字以内の英数字で構成する。
    string scope = AccountServer() + "|" + Symbol();
    uint scopeHash = 2166136261;
@@ -114,6 +122,13 @@ int OnInit()
       scopeHash = (scopeHash ^ (uint)StringGetCharacter(scope, k)) * 16777619;
    exitPrefix = "STR02." + IntegerToString(AccountNumber()) + "." +
                 IntegerToString(MAGIC) + "." + IntegerToString((int)scopeHash) + ".";
+   gSendKey = exitPrefix + "send";
+   gSendNumber = 0;
+   gSendHandled = false;
+   if(!IsTesting() && GlobalVariableCheck(gSendKey) &&
+      !GlobalVariableGet(gSendKey, gSendNumber)) return(INIT_FAILED);
+   if(gSendNumber > 0)
+      Print(gLogIdentity, "event=SEND_CHECK_REQUIRED id=", DoubleToString(gSendNumber, 0));
    // 実運用では最初の有効なティックで現在足を既処理化する。テスターは従来の開始判定を維持する。
    entryReady = IsTesting();
 
@@ -152,6 +167,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   if(gReleasePending) gReleasePending = !TC_End(true);
    if(equityFile != INVALID_HANDLE)
    {
       // テスター出力ファイルを閉じる前に、最後の観測値を書き出す。
@@ -169,8 +185,38 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   if(gReleasePending) gReleasePending = !TC_End(true);
+   // 結果不明の新規注文は実注文・履歴と照合する。見つからない間は再送しない。
+   if(gSendNumber > 0)
+   {
+      string tag = COMMENT + "#" + DoubleToString(gSendNumber, 0);
+      int found = -1;
+      for(int pool = 0; pool < 2 && found < 0; pool++)
+      {
+         int total = (pool == 0 ? OrdersTotal() : OrdersHistoryTotal());
+         for(int index = total - 1; index >= 0; index--)
+         {
+            if(!OrderSelect(index, SELECT_BY_POS, pool == 0 ? MODE_TRADES : MODE_HISTORY)) continue;
+            if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
+               StringFind(OrderComment(), tag) == 0) { found = OrderTicket(); break; }
+         }
+      }
+      if(found > 0 && (IsTesting() || GlobalVariableSet(gSendKey, -gSendNumber) != 0))
+      {
+         gSendNumber = -gSendNumber;
+         entryRetryPending = false;
+         if(!IsTesting()) GlobalVariablesFlush();
+         if(!gSendHandled)
+         {
+            int mailCount = ArraySize(gEntryMailTickets);
+            if(ArrayResize(gEntryMailTickets, mailCount + 1) == mailCount + 1)
+               gEntryMailTickets[mailCount] = found;
+         }
+         Print(gLogIdentity, "event=SEND_RECONCILED ticket=", found);
+      }
+   }
    // 待機注文がBuy/Sellに変わった時だけ通知し、処理済みticketを外す。
-   for(int mailIndex=ArraySize(gEntryMailTickets)-1; mailIndex>=0; mailIndex--)
+   for(int mailIndex=ArraySize(gEntryMailTickets)-1; !gReleasePending && mailIndex>=0; mailIndex--)
    {
       if(!OrderSelect(gEntryMailTickets[mailIndex],SELECT_BY_TICKET)) continue;
       if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC)
@@ -263,29 +309,35 @@ void OnTick()
             GlobalVariablesFlush();
       }
       // 自動売買禁止・通信断・他EAの取引処理中でも、決済要求を取り消さず次のティックへ持ち越す。
-      exitRetryTimes[pendingIndex] = now + 5;
-      if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()))
+      if(gReleasePending || !IsTradeAllowed() || (!IsTesting() && !IsConnected()) || !TC_Begin())
          continue;
       RefreshRates();
       // 再試行直前にチケットを再選択し、SL約定・手動決済済みの注文を再送しない。
       if(!OrderSelect(ticket, SELECT_BY_TICKET))
       {
-         Print(gLogIdentity, "event=EXIT_SELECT_FAILED message=", "Exit OrderSelect failed ticket=", ticket, " error=", GetLastError());
+         int selectError = GetLastError();
+         TC_End(false);
+         Print(gLogIdentity, "event=EXIT_SELECT_FAILED message=", "Exit OrderSelect failed ticket=", ticket, " error=", selectError);
          continue;
       }
       if(OrderCloseTime() != 0 || OrderSymbol() != Symbol() ||
          OrderMagicNumber() != MAGIC || OrderType() != side)
-         continue;
+      { TC_End(false); continue; }
       double price = (side == OP_BUY ? Bid : Ask);
       double freeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
 
       // ポジションのSLがブローカーのフリーズレベル内にある間は決済要求を保持して待機する。
       if(price <= 0 || (freeze > 0 && OrderStopLoss() > 0 &&
-         MathAbs(price - OrderStopLoss()) <= freeze))
-         continue;
+         MathAbs(price - OrderStopLoss()) <= freeze) ||
+         !IsTradeAllowed() || (!IsTesting() && !IsConnected()))
+      { TC_End(false); continue; }
       ResetLastError();
-      if(!OrderClose(ticket, OrderLots(), price, slippage, clrNONE))
-         Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", ticket, " error=", GetLastError(), "; retry after >=5 seconds");
+      bool closed = OrderClose(ticket, OrderLots(), price, slippage, clrNONE);
+      int closeError = GetLastError();
+      gReleasePending = !TC_End(true);
+      exitRetryTimes[pendingIndex] = TimeCurrent() + 5;
+      if(!closed)
+         Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", ticket, " error=", closeError, "; retry after >=5 seconds");
       else
       {
          exitTickets[pendingIndex] = exitTickets[ArraySize(exitTickets) - 1];
@@ -300,38 +352,142 @@ void OnTick()
          }
       }
    }
-   // 頻度制限で拒否された指値だけを、最初に検証した内容のまま同じH1バー内で再送する。
+   if(entryRetryPending && (!historyReady || !AllowNewEntries || !stateHealthy || occupied ||
+      bar != entryRetryBar || (entryRetryStarted > 0 && now > entryRetryStarted + 5) ||
+      (entryRetryExpiration > 0 && now >= entryRetryExpiration)))
+      entryRetryPending = false;
+   // このEAのポジションがある場合、そのバーでは新規エントリーしない。決済したバーも再発注しない。
+   if(!entryRetryPending && gSendNumber <= 0 && !occupied && newBar && historyReady && AllowNewEntries && stateHealthy)
+   {
+      // 他EAの送信中でも候補を保存する。自動売買OFF時は従来どおりそのバーを見送る。
+      if((IsTesting() && !IsTradeAllowed()) || (!IsTesting() &&
+         (!IsConnected() || !MQLInfoInteger(MQL_TRADE_ALLOWED) || !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))))
+         return;
+      RefreshRates();
+      if(Bid <= 0 || Ask <= Bid || Ask - Bid > MaxSpreadPips * pip)
+         return;
+      // EMA(200)で方向を判定し、確定済みRSI(2)の押し目・戻りを探す。
+      double trend = iMA(Symbol(), PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE, 1);
+      double close1 = iClose(Symbol(), PERIOD_H1, 1);
+      int side = -1;
+      if(close1 > trend && rsi < RSIEntry)
+         side = OP_BUY;
+      if(close1 < trend && rsi > 100.0 - RSIEntry)
+         side = OP_SELL;
+      if(side < 0)
+         return;
+      // ATRベースのSLを作成し、銘柄のtick・取引数量設定を検証する。
+      double atr = iATR(Symbol(), PERIOD_H1, 14, 1);
+      double tick = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
+      double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
+      double step = MarketInfo(Symbol(), MODE_LOTSTEP);
+      if(atr <= 0 || tick <= 0 || tickValue <= 0 || step <= 0)
+         return;
+      // 費用に対する回復値幅が小さい局面を除外する。閾値と等しい場合は許可する。
+      if(MinATRSpreadRatio > 0 && atr < MinATRSpreadRatio * (Ask - Bid))
+         return;
+      int orderCmd = side;
+      datetime expiration = 0;
+      double entry = (side == OP_BUY ? Ask : Bid);
+      if(EntryPullbackATR > 0)
+      {
+         orderCmd = (side == OP_BUY ? OP_BUYLIMIT : OP_SELLLIMIT);
+         entry = (side == OP_BUY ? Ask - EntryPullbackATR * atr : Bid + EntryPullbackATR * atr);
+         entry = NormalizeDouble((side == OP_BUY ? MathFloor(entry / tick) : MathCeil(entry / tick)) * tick,
+                                 Digits);
+         expiration = bar + 3600;
+      }
+      double stop = entry + (side == OP_BUY ? -1.0 : 1.0) * StopATR * atr;
+
+      // 不利な方向へ丸め、SLがtick刻み上で有効になるように整列する。
+      stop = NormalizeDouble((side == OP_BUY ? MathFloor(stop / tick) : MathCeil(stop / tick)) * tick,
+                             Digits);
+      double minDistance = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick;
+      if(EntryPullbackATR > 0)
+      {
+         if(side == OP_BUY && (Ask - entry < minDistance || entry - stop < minDistance))
+            return;
+         if(side == OP_SELL && (entry - Bid < minDistance || stop - entry < minDistance))
+            return;
+      }
+      else
+      {
+         if(side == OP_BUY && Bid - stop < minDistance)
+            return;
+         if(side == OP_SELL && stop - Ask < minDistance)
+            return;
+      }
+      // 計算したSLまでの金銭的リスクを基準にポジションサイズを決定する。
+      double capital = MathMin(AccountBalance(), AccountEquity());
+      double riskPerLot = MathAbs(entry - stop) / tick * tickValue;
+      double lots = MathMin(capital * EntryRiskPercent / 100.0 / riskPerLot,
+                            MarketInfo(Symbol(), MODE_MAXLOT));
+      lots = NormalizeDouble(MathFloor((lots + 1e-10) / step) * step, 8);
+      if(lots < MarketInfo(Symbol(), MODE_MINLOT))
+         return;
+
+      // 発注後も資本の30%を余剰証拠金として残せることを確認する。
+      ResetLastError();
+      double freeAfter = AccountFreeMarginCheck(Symbol(), side, lots);
+      if(GetLastError() != 0 || freeAfter < 0.3 * capital)
+         return;
+      // 新バーで確定した要求を保存する。未送信では5秒の再送期限を開始しない。
+      entryRetryPending = true;
+      entryRetryBar = bar;
+      entryRetryStarted = 0;
+      entryRetryNext = 0;
+      entryRetryCmd = orderCmd;
+      entryRetrySide = side;
+      entryRetryLots = lots;
+      entryRetryPrice = entry;
+      entryRetryStop = stop;
+      entryRetryATR = atr;
+      entryRetryExpiration = expiration;
+   }
+   // 初回未送信と8/141の再送を区別し、保存した要求を同じH1バー内で処理する。
    if(entryRetryPending)
    {
-      if(!historyReady || !AllowNewEntries || !stateHealthy || occupied || bar != entryRetryBar || now > entryRetryStarted + 5 ||
-         now >= entryRetryExpiration)
+      if(!historyReady || !AllowNewEntries || !stateHealthy || occupied || bar != entryRetryBar || (entryRetryStarted > 0 && now > entryRetryStarted + 5) ||
+         (entryRetryExpiration > 0 && now >= entryRetryExpiration))
       {
          entryRetryPending = false;
       }
-      else if(now >= entryRetryNext)
+      else if(!gReleasePending && gSendNumber <= 0 && now >= entryRetryNext)
       {
-         // 再送直前にも初回と同じ安全条件を確認する。価格、SL、数量は再計算しない。
-         if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()))
-            entryRetryNext = now + 2;
-         else
+         // 送信直前にも安全条件を確認する。指値価格・SL・数量は保持し、成行価格は直前に更新する。
+         if(IsTradeAllowed() && (IsTesting() || IsConnected()) && TC_Begin())
          {
+            bool retryOccupied = false;
+            bool retryReadable = true;
+            for(int check = OrdersTotal() - 1; check >= 0; check--)
+            {
+               if(!OrderSelect(check, SELECT_BY_POS, MODE_TRADES)) { retryReadable = false; break; }
+               if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC) retryOccupied = true;
+            }
             RefreshRates();
             double retryTick = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
             double retryStep = MarketInfo(Symbol(), MODE_LOTSTEP);
             double retryMinDistance = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + retryTick;
             double retryCapital = MathMin(AccountBalance(), AccountEquity());
-            bool retryValid = (Bid > 0 && Ask > Bid && retryTick > 0 && retryStep > 0 &&
+            bool retryValid = (retryReadable && !retryOccupied && AllowNewEntries && stateHealthy &&
+                               iTime(Symbol(), PERIOD_H1, 0) == entryRetryBar &&
+                               (entryRetryExpiration == 0 || TimeCurrent() < entryRetryExpiration) &&
+                               (entryRetryStarted == 0 || TimeCurrent() <= entryRetryStarted + 5) &&
+                               Bid > 0 && Ask > Bid && retryTick > 0 && retryStep > 0 &&
                                Ask - Bid <= MaxSpreadPips * pip &&
                                (MinATRSpreadRatio <= 0 || entryRetryATR >= MinATRSpreadRatio * (Ask - Bid)) &&
                                entryRetryLots >= MarketInfo(Symbol(), MODE_MINLOT) &&
                                entryRetryLots <= MarketInfo(Symbol(), MODE_MAXLOT) &&
                                MathAbs(entryRetryLots / retryStep - MathRound(entryRetryLots / retryStep)) <= 1.0e-8);
-            if(entryRetrySide == OP_BUY)
+            if(entryRetryCmd == OP_BUYLIMIT)
                retryValid = retryValid && Ask - entryRetryPrice >= retryMinDistance &&
                             entryRetryPrice - entryRetryStop >= retryMinDistance;
-            else
+            else if(entryRetryCmd == OP_SELLLIMIT)
                retryValid = retryValid && entryRetryPrice - Bid >= retryMinDistance &&
                             entryRetryStop - entryRetryPrice >= retryMinDistance;
+            else
+               retryValid = retryValid && (entryRetrySide == OP_BUY ?
+                            Bid - entryRetryStop : entryRetryStop - Ask) >= retryMinDistance;
             ResetLastError();
             double retryFreeAfter = retryValid ? AccountFreeMarginCheck(Symbol(), entryRetrySide,
                                                                          entryRetryLots) : -1;
@@ -340,148 +496,97 @@ void OnTick()
                          retryFreeAfter >= 0.3 * retryCapital;
             if(!retryValid)
             {
+               TC_End(false);
                Print(gLogIdentity, "event=ENTRY_RETRY_CANCELLED message=", "Entry retry cancelled: current safety condition failed.");
                entryRetryPending = false;
             }
             else
             {
+               bool retrying = (entryRetryStarted > 0);
+               gSendHandled = false;
+               gSendNumber = MathMax(MathAbs(gSendNumber) + 1, (double)TimeLocal() * 1000.0);
+               if(!IsTesting() && GlobalVariableSet(gSendKey, gSendNumber) == 0)
+               {
+                  TC_End(false);
+                  stateHealthy = false;
+                  entryRetryPending = false;
+                  Print(gLogIdentity, "event=SEND_SAVE_FAILED");
+                  return;
+               }
+               if(!IsTesting()) GlobalVariablesFlush();
+               RefreshRates();
+               bool sendValid = iTime(Symbol(), PERIOD_H1, 0) == entryRetryBar &&
+                                (entryRetryExpiration == 0 || TimeCurrent() < entryRetryExpiration) &&
+                                (entryRetryStarted == 0 || TimeCurrent() <= entryRetryStarted + 5) &&
+                                Bid > 0 && Ask > Bid && Ask - Bid <= MaxSpreadPips * pip &&
+                                (MinATRSpreadRatio <= 0 || entryRetryATR >= MinATRSpreadRatio * (Ask - Bid));
+               if(entryRetryCmd == OP_BUYLIMIT)
+                  sendValid = sendValid && Ask - entryRetryPrice >= retryMinDistance;
+               else if(entryRetryCmd == OP_SELLLIMIT)
+                  sendValid = sendValid && entryRetryPrice - Bid >= retryMinDistance;
+               else
+                  sendValid = sendValid && (entryRetrySide == OP_BUY ?
+                              Bid - entryRetryStop : entryRetryStop - Ask) >= retryMinDistance;
+               // 指値は予約価格を維持。成行は最新気配を使い、固定したSL・数量のリスクを再確認する。
+               double sendPrice = (entryRetryCmd == OP_BUY ? Ask :
+                                   entryRetryCmd == OP_SELL ? Bid : entryRetryPrice);
+               double sendTickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
+               double sendRisk = MathAbs(sendPrice - entryRetryStop) / retryTick * sendTickValue * entryRetryLots;
+               sendValid = sendValid && sendTickValue > 0 &&
+                           sendRisk <= MathMin(AccountBalance(), AccountEquity()) * EntryRiskPercent / 100.0 + 1e-8;
+               if(!sendValid || !IsTradeAllowed() || (!IsTesting() && !IsConnected()))
+               {
+                  if(IsTesting() || GlobalVariableSet(gSendKey, -gSendNumber) != 0)
+                     gSendNumber = -gSendNumber;
+                  if(!IsTesting()) GlobalVariablesFlush();
+                  TC_End(false);
+                  entryRetryPending = sendValid && gSendNumber <= 0;
+                  return;
+               }
                ResetLastError();
                int retryTicket = OrderSend(Symbol(), entryRetryCmd, entryRetryLots,
-                                           entryRetryPrice, slippage, entryRetryStop, 0,
-                                           COMMENT, MAGIC, entryRetryExpiration, clrNONE);
+                                           sendPrice, slippage, entryRetryStop, 0,
+                                           COMMENT + "#" + DoubleToString(gSendNumber, 0), MAGIC, entryRetryExpiration, clrNONE);
+               int retryError = GetLastError();
+               gReleasePending = !TC_End(true);
+               bool unknown = retryTicket < 0 && (retryError == 0 || retryError == 1 ||
+                              retryError == 2 || retryError == 6 || retryError == 128);
+               bool saved = !unknown && (IsTesting() || GlobalVariableSet(gSendKey, -gSendNumber) != 0);
+               if(saved) gSendNumber = -gSendNumber;
+               if(!IsTesting()) GlobalVariablesFlush();
                if(retryTicket >= 0)
                {
-                  Print(gLogIdentity, "event=ENTRY_RETRY_OK message=", "Pending entry retry succeeded ticket=", retryTicket);
+                  gSendHandled = true;
+                  if(retrying)
+                     Print(gLogIdentity, "event=ENTRY_RETRY_OK message=", "Pending entry retry succeeded ticket=", retryTicket);
+                  else if(entryRetryCmd >= OP_BUYLIMIT)
+                     Print(gLogIdentity, "event=ENTRY_PENDING message=", "Pending entry ticket=", retryTicket,
+                           " side=", (entryRetrySide == OP_BUY ? "BUY" : "SELL"),
+                           " entryATR=", DoubleToString(entryRetryATR, Digits),
+                           " limit=", DoubleToString(entryRetryPrice, Digits),
+                           " expiration=", TimeToString(entryRetryExpiration, TIME_DATE | TIME_SECONDS));
                   entryRetryPending = false;
                   int mailCount=ArraySize(gEntryMailTickets);
-                  if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
+                  if(!gReleasePending && OrderSelect(retryTicket, SELECT_BY_TICKET) &&
+                     (OrderType() == OP_BUY || OrderType() == OP_SELL))
+                     MySendMail(COMMENT, OrderType() == OP_BUY ? 1 : 2);
+                  else if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
                      gEntryMailTickets[mailCount]=retryTicket;
                }
                else
                {
-                  int retryError = GetLastError();
-                  Print(gLogIdentity, "event=ENTRY_RETRY_FAILED message=", "Entry retry failed error=", retryError);
-                  if(retryError == 8 || retryError == 141)
-                     entryRetryNext = now + 2;
+                  Print(gLogIdentity, retrying ? "event=ENTRY_RETRY_FAILED message=" : "event=ENTRY_FAILED message=",
+                        "Entry failed error=", retryError);
+                  if(saved && entryRetryCmd >= OP_BUYLIMIT && (retryError == 8 || retryError == 141))
+                  {
+                     if(entryRetryStarted == 0) entryRetryStarted = TimeCurrent();
+                     entryRetryNext = TimeCurrent() + 2;
+                  }
                   else
                      entryRetryPending = false;
                }
             }
          }
-      }
-   }
-   // このEAのポジションがある場合、そのバーでは新規エントリーしない。決済したバーも再発注しない。
-   if(entryRetryPending || occupied || !newBar || !historyReady || !AllowNewEntries || !stateHealthy)
-      return;
-   // 初回発注は新バーのみ。指値の8/141以外の失敗は再送せず、二重発注を避ける。
-   if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()))
-      return;
-   RefreshRates();
-   if(Bid <= 0 || Ask <= Bid || Ask - Bid > MaxSpreadPips * pip)
-      return;
-   // EMA(200)で方向を判定し、確定済みRSI(2)の押し目・戻りを探す。
-   double trend = iMA(Symbol(), PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE, 1);
-   double close1 = iClose(Symbol(), PERIOD_H1, 1);
-   int side = -1;
-   if(close1 > trend && rsi < RSIEntry)
-      side = OP_BUY;
-   if(close1 < trend && rsi > 100.0 - RSIEntry)
-      side = OP_SELL;
-   if(side < 0)
-      return;
-   // ATRベースのSLを作成し、銘柄のtick・取引数量設定を検証する。
-   double atr = iATR(Symbol(), PERIOD_H1, 14, 1);
-   double tick = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
-   double tickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
-   double step = MarketInfo(Symbol(), MODE_LOTSTEP);
-   if(atr <= 0 || tick <= 0 || tickValue <= 0 || step <= 0)
-      return;
-   // 費用に対する回復値幅が小さい局面を除外する。閾値と等しい場合は許可する。
-   if(MinATRSpreadRatio > 0 && atr < MinATRSpreadRatio * (Ask - Bid))
-      return;
-   int orderCmd = side;
-   datetime expiration = 0;
-   double entry = (side == OP_BUY ? Ask : Bid);
-   if(EntryPullbackATR > 0)
-   {
-      orderCmd = (side == OP_BUY ? OP_BUYLIMIT : OP_SELLLIMIT);
-      entry = (side == OP_BUY ? Ask - EntryPullbackATR * atr : Bid + EntryPullbackATR * atr);
-      entry = NormalizeDouble((side == OP_BUY ? MathFloor(entry / tick) : MathCeil(entry / tick)) * tick,
-                              Digits);
-      expiration = bar + 3600;
-   }
-   double stop = entry + (side == OP_BUY ? -1.0 : 1.0) * StopATR * atr;
-
-   // 不利な方向へ丸め、SLがtick刻み上で有効になるように整列する。
-   stop = NormalizeDouble((side == OP_BUY ? MathFloor(stop / tick) : MathCeil(stop / tick)) * tick,
-                          Digits);
-   double minDistance = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick;
-   if(EntryPullbackATR > 0)
-   {
-      if(side == OP_BUY && (Ask - entry < minDistance || entry - stop < minDistance))
-         return;
-      if(side == OP_SELL && (entry - Bid < minDistance || stop - entry < minDistance))
-         return;
-   }
-   else
-   {
-      if(side == OP_BUY && Bid - stop < minDistance)
-         return;
-      if(side == OP_SELL && stop - Ask < minDistance)
-         return;
-   }
-   // 計算したSLまでの金銭的リスクを基準にポジションサイズを決定する。
-   double capital = MathMin(AccountBalance(), AccountEquity());
-   double riskPerLot = MathAbs(entry - stop) / tick * tickValue;
-   double lots = MathMin(capital * EntryRiskPercent / 100.0 / riskPerLot,
-                         MarketInfo(Symbol(), MODE_MAXLOT));
-   lots = NormalizeDouble(MathFloor((lots + 1e-10) / step) * step, 8);
-   if(lots < MarketInfo(Symbol(), MODE_MINLOT))
-      return;
-
-   // 発注後も資本の30%を余剰証拠金として残せることを確認する。
-   ResetLastError();
-   double freeAfter = AccountFreeMarginCheck(Symbol(), side, lots);
-   if(GetLastError() != 0 || freeAfter < 0.3 * capital)
-      return;
-   // ATR初期SLを付け、TPなしの成行または期限付き指値注文を送信する。
-   ResetLastError();
-   int ticket = OrderSend(Symbol(), orderCmd, lots, entry, slippage, stop, 0,
-                          COMMENT, MAGIC, expiration, clrNONE);
-   if(ticket < 0)
-   {
-      int entryError = GetLastError();
-      Print(gLogIdentity, "event=ENTRY_FAILED message=", "Entry failed error=", entryError);
-      if(EntryPullbackATR > 0 && (entryError == 8 || entryError == 141))
-      {
-         entryRetryPending = true;
-         entryRetryBar = bar;
-         entryRetryStarted = now;
-         entryRetryNext = now + 2;
-         entryRetryCmd = orderCmd;
-         entryRetrySide = side;
-         entryRetryLots = lots;
-         entryRetryPrice = entry;
-         entryRetryStop = stop;
-         entryRetryATR = atr;
-         entryRetryExpiration = expiration;
-      }
-   }
-   else if(EntryPullbackATR > 0)
-      Print(gLogIdentity, "event=ENTRY_PENDING message=", "Pending entry ticket=", ticket, " side=", (side == OP_BUY ? "BUY" : "SELL"),
-            " entryATR=", DoubleToString(atr, Digits),
-            " limit=", DoubleToString(entry, Digits),
-            " expiration=", TimeToString(expiration, TIME_DATE | TIME_SECONDS));
-   if(ticket >= 0)
-   {
-      if(OrderSelect(ticket,SELECT_BY_TICKET) &&
-         (OrderType()==OP_BUY || OrderType()==OP_SELL))
-         MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
-      else
-      {
-         int mailCount=ArraySize(gEntryMailTickets);
-         if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
-            gEntryMailTickets[mailCount]=ticket;
       }
    }
 }

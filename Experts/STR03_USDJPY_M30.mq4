@@ -39,6 +39,7 @@
 #property strict
 
 #include <Original/Mail.mqh>
+#include <Original/TradeControl.mqh>
 
 #define MAGIC 20260926
 #define COMMENT "STR03_USDJPY_M30"
@@ -76,6 +77,9 @@ datetime lastTick = 0;
 double lastEquity = 0;
 double lastBalance = 0;
 int equityFile = INVALID_HANDLE;
+bool gReleasePending = false;
+int gEntryMailTicket = -1;
+int partialPendingDate = 0;
 int exitTicket = -1;
 int stopTicket = -1;
 double stopTarget = 0;
@@ -148,6 +152,11 @@ int OnInit()
          return(INIT_PARAMETERS_INCORRECT);
    }
 
+   if(!TC_Init(2000)) return(INIT_FAILED);
+   gReleasePending = false;
+   gEntryMailTicket = -1;
+   partialPendingDate = 0;
+
    // 運用中に装着・再初期化した場合は新規発注だけを途中参加させない。
    // 既存ポジションの決済・SL補正状態は端末Global Variableから復元する。
    if(!IsTesting())
@@ -176,6 +185,8 @@ int OnInit()
          blockedSellDate = (int)GlobalVariableGet(statePrefix + ".sellblock");
       if(GlobalVariableCheck(statePrefix + ".retry"))
          nextEntryAttempt = (datetime)GlobalVariableGet(statePrefix + ".retry");
+      if(GlobalVariableCheck(statePrefix + ".splitwait"))
+         partialPendingDate = (int)GlobalVariableGet(statePrefix + ".splitwait");
       for(int i = OrdersTotal() - 1; i >= 0; i--)
       {
          if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
@@ -237,6 +248,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   if(gReleasePending) gReleasePending = !TC_End(true);
    if(equityFile != INVALID_HANDLE)
    {
       // 最終観測時点の有効証拠金と残高を記録してファイルを閉じる。
@@ -253,6 +265,14 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   if(gReleasePending) gReleasePending = !TC_End(true);
+   if(!gReleasePending && gEntryMailTicket >= 0 && OrderSelect(gEntryMailTicket, SELECT_BY_TICKET))
+   {
+      if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
+         (OrderType() == OP_BUY || OrderType() == OP_SELL))
+         MySendMail(COMMENT, OrderType() == OP_BUY ? 1 : 2);
+      gEntryMailTicket = -1;
+   }
    // このティックのサーバー時刻を取得し、売買できない場合も資産の観測値を更新する。
    datetime now = TimeCurrent();
    RecordEquitySnapshot(now);
@@ -356,7 +376,7 @@ void GetTokyoClock(const datetime now, datetime &tokyoNow, int &tokyoDate,
 //+------------------------------------------------------------------+
 void RetryPendingExit(bool &exitAttempted)
 {
-   if(exitTicket >= 0)
+   if(exitTicket >= 0 && !exitAttempted)
    {
       int pendingExit = exitTicket;
       if(!OrderSelect(pendingExit, SELECT_BY_TICKET))
@@ -384,15 +404,26 @@ void RetryPendingExit(bool &exitAttempted)
          {
             // 決済が成立しなくても、今回のティックでは試行済みとして扱う。
             // 決済待ちのチケットを残しておくことで、後続ティックで再試行できる。
-            exitAttempted = true;
+            if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) return;
+            RefreshRates();
+            if(!OrderSelect(pendingExit, SELECT_BY_TICKET) || OrderCloseTime() != 0 ||
+               OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC ||
+               (OrderType() != OP_BUY && OrderType() != OP_SELL))
+            { TC_End(false); return; }
             int pendingSide = OrderType();
             double pendingPrice = (pendingSide == OP_BUY ? Bid : Ask);
             double pendingFreeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
             // 既存SLが凍結範囲内にある間は決済を保留する。
-            if(pendingFreeze <= 0 || OrderStopLoss() <= 0 ||
-               MathAbs(pendingPrice - OrderStopLoss()) > pendingFreeze)
+            if(pendingPrice > 0 && IsTradeAllowed() && (IsTesting() || IsConnected()) &&
+               (pendingFreeze <= 0 || OrderStopLoss() <= 0 ||
+                MathAbs(pendingPrice - OrderStopLoss()) > pendingFreeze))
             {
-               if(OrderClose(pendingExit, OrderLots(), pendingPrice, Slippage, clrNONE))
+               ResetLastError();
+               bool closed = OrderClose(pendingExit, OrderLots(), pendingPrice, Slippage, clrNONE);
+               int closeError = GetLastError();
+               gReleasePending = !TC_End(true);
+               exitAttempted = true;
+               if(closed)
                {
                   lastClose = TimeCurrent();
                   exitTicket = -1;
@@ -406,8 +437,9 @@ void RetryPendingExit(bool &exitAttempted)
                      GlobalVariablesFlush();
                   }
                }
-               else Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", pendingExit, " error=", GetLastError());
+               else Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", pendingExit, " error=", closeError);
             }
+            else TC_End(false);
          }
       }
    }
@@ -422,6 +454,7 @@ void CorrectPendingStop(const double tick)
    // スリッページがあれば、約定価格を基準に初期SLを補正する。既存SLは外さない。
    if(stopTicket >= 0)
    {
+      // 約定価格を取得する。失敗しても補正待ちの状態は残し、後続ティックで扱う。
       if(!OrderSelect(stopTicket, SELECT_BY_TICKET))
          Print(gLogIdentity, "event=SL_SELECT_FAILED message=", "SL OrderSelect failed error=", GetLastError());
       else
@@ -467,8 +500,26 @@ void CorrectPendingStop(const double tick)
                double freeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
                if(distance >= MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick && distance > freeze)
                {
-                  if(OrderModify(pendingStop, OrderOpenPrice(), stopTarget,
-                                 OrderTakeProfit(), 0, clrNONE))
+                  if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) return;
+                  RefreshRates();
+                  if(!OrderSelect(pendingStop, SELECT_BY_TICKET) || OrderCloseTime() != 0 ||
+                     OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC ||
+                     (OrderType() != OP_BUY && OrderType() != OP_SELL))
+                  { TC_End(false); return; }
+                  market = (OrderType() == OP_BUY ? Bid : Ask);
+                  distance = (OrderType() == OP_BUY ? market - stopTarget : stopTarget - market);
+                  freeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
+                  if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()) || market <= 0 ||
+                     distance < MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick || distance <= freeze ||
+                     (freeze > 0 && OrderStopLoss() > 0 && MathAbs(market - OrderStopLoss()) <= freeze) ||
+                     MathAbs(OrderStopLoss() - stopTarget) < tick / 2)
+                  { TC_End(false); return; }
+                  ResetLastError();
+                  bool modified = OrderModify(pendingStop, OrderOpenPrice(), stopTarget,
+                                              OrderTakeProfit(), 0, clrNONE);
+                  int modifyError = GetLastError();
+                  gReleasePending = !TC_End(true);
+                  if(modified)
                   {
                      stopTicket = -1;
                      splitStopDistance = 0;
@@ -479,7 +530,7 @@ void CorrectPendingStop(const double tick)
                         GlobalVariablesFlush();
                      }
                   }
-                  else Print(gLogIdentity, "event=SL_MODIFY_FAILED message=", "SL correction failed ticket=", pendingStop, " error=", GetLastError());
+                  else Print(gLogIdentity, "event=SL_MODIFY_FAILED message=", "SL correction failed ticket=", pendingStop, " error=", modifyError);
                }
             }
          }
@@ -594,7 +645,13 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                GlobalVariablesFlush();
             }
          }
-         if(lastTokyoSellPartialDate != openTokyoDate)
+         if(lastTokyoSellPartialDate == openTokyoDate && partialPendingDate == openTokyoDate)
+         {
+            if(IsTesting() || !GlobalVariableCheck(statePrefix + ".splitwait") ||
+               GlobalVariableDel(statePrefix + ".splitwait")) partialPendingDate = 0;
+            if(!IsTesting()) GlobalVariablesFlush();
+         }
+         if(lastTokyoSellPartialDate != openTokyoDate && partialPendingDate != openTokyoDate)
          {
             double firstLots = (lotStep > 0 ?
                                 NormalizeDouble(MathFloor(actualLots * SellFirstClosePercent /
@@ -617,12 +674,19 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
             }
             else
             {
+               if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) continue;
                RefreshRates();
+               if(!OrderSelect(activeTicket, SELECT_BY_TICKET) || OrderCloseTime() != 0 ||
+                  OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC || OrderType() != OP_SELL ||
+                  MathAbs(OrderLots() - actualLots) > lotTolerance)
+               { TC_End(false); continue; }
                double partialPrice = Ask;
                double partialFreeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
-               if(partialFreeze <= 0 || OrderStopLoss() <= 0 ||
-                  MathAbs(partialPrice - OrderStopLoss()) > partialFreeze)
+               if(partialPrice > 0 && IsTradeAllowed() && (IsTesting() || IsConnected()) &&
+                  (partialFreeze <= 0 || OrderStopLoss() <= 0 ||
+                   MathAbs(partialPrice - OrderStopLoss()) > partialFreeze))
                {
+                  partialPendingDate = openTokyoDate;
                   // 数量と補正幅を先に保存し、約定直後の再起動にも備える。
                   if(stopTicket == activeTicket)
                   {
@@ -633,17 +697,58 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                   {
                      if(GlobalVariableSet(partialBaseKey, partialBaseLots) == 0 ||
                         (splitStopDate == openTokyoDate && splitStopDistance > 0 &&
-                         GlobalVariableSet(splitStopKey, splitStopDistance) == 0))
+                         GlobalVariableSet(splitStopKey, splitStopDistance) == 0) ||
+                        GlobalVariableSet(statePrefix + ".splitwait", partialPendingDate) == 0)
                      {
+                        int saveError = GetLastError();
+                        TC_End(false);
+                        partialPendingDate = 0;
                         Print(gLogIdentity, "event=PARTIAL_STATE_SAVE_FAILED message=", "Partial state save failed ticket=", activeTicket,
-                              " error=", GetLastError());
+                              " error=", saveError);
                         continue;
                      }
                      GlobalVariablesFlush();
                   }
                   RefreshRates();
                   partialPrice = Ask;
-                  if(OrderClose(activeTicket, firstLots, partialPrice, Slippage, clrNONE))
+                  int currentDate = 0, currentMinute = -1;
+                  datetime currentTokyo = 0;
+                  bool currentTransition = false;
+                  GetTokyoClock(TimeCurrent(), currentTokyo, currentDate, currentMinute, currentTransition);
+                  bool partialValid = OrderSelect(activeTicket, SELECT_BY_TICKET) && OrderCloseTime() == 0 &&
+                                      OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC && OrderType() == OP_SELL &&
+                                      MathAbs(OrderLots() - actualLots) <= lotTolerance;
+                  partialFreeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
+                  double currentStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+                  double currentMinLot = MarketInfo(Symbol(), MODE_MINLOT);
+                  partialValid = partialValid && currentStep > 0 && firstLots >= currentMinLot &&
+                                 remainingLots >= currentMinLot &&
+                                 MathAbs(firstLots / currentStep - MathRound(firstLots / currentStep)) <= 1e-7 &&
+                                 MathAbs(remainingLots / currentStep - MathRound(remainingLots / currentStep)) <= 1e-7;
+                  partialValid = partialValid && IsTradeAllowed() && (IsTesting() || IsConnected()) && partialPrice > 0 &&
+                                 currentDate == openTokyoDate && currentMinute >= TokyoExitMinute && currentMinute < SellFinalMinute &&
+                                 (partialFreeze <= 0 || OrderStopLoss() <= 0 || MathAbs(partialPrice - OrderStopLoss()) > partialFreeze);
+                  if(!partialValid)
+                  {
+                     if(IsTesting() || !GlobalVariableCheck(statePrefix + ".splitwait") ||
+                        GlobalVariableDel(statePrefix + ".splitwait")) partialPendingDate = 0;
+                     if(!IsTesting()) GlobalVariablesFlush();
+                     TC_End(false);
+                     continue;
+                  }
+                  ResetLastError();
+                  bool closed = OrderClose(activeTicket, firstLots, partialPrice, Slippage, clrNONE);
+                  int closeError = GetLastError();
+                  gReleasePending = !TC_End(true);
+                  exitAttempted = true;
+                  bool unknown = !closed && (closeError == 0 || closeError == 1 || closeError == 2 || closeError == 6 || closeError == 128);
+                  if(!unknown)
+                  {
+                     if(IsTesting() || !GlobalVariableCheck(statePrefix + ".splitwait") ||
+                        GlobalVariableDel(statePrefix + ".splitwait")) partialPendingDate = 0;
+                     if(!IsTesting()) GlobalVariablesFlush();
+                  }
+                  if(closed)
                   {
                      lastTokyoSellPartialDate = openTokyoDate;
                      if(!IsTesting())
@@ -655,8 +760,9 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                   }
                   else Print(gLogIdentity, "event=PARTIAL_EXIT_FAILED message=", "Partial exit failed ticket=", activeTicket,
                              " lots=", DoubleToString(firstLots, 8),
-                             " error=", GetLastError());
+                             " error=", closeError);
                }
+               else TC_End(false);
                continue;
             }
          }
@@ -687,11 +793,29 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                (breakEvenFreeze <= 0 || OrderStopLoss() <= 0 ||
                 MathAbs(breakEvenMarket - OrderStopLoss()) > breakEvenFreeze))
             {
-               if(OrderModify(activeTicket, OrderOpenPrice(), breakEvenStop,
-                              OrderTakeProfit(), 0, clrNONE))
-                  continue;
+               if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) continue;
+               RefreshRates();
+               if(!OrderSelect(activeTicket, SELECT_BY_TICKET) || OrderCloseTime() != 0 ||
+                  OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC || OrderType() != OP_BUY)
+               { TC_End(false); continue; }
+               breakEvenMarket = Bid;
+               breakEvenGap = breakEvenMarket - breakEvenStop;
+               breakEvenFreeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
+               breakEvenImproves = (OrderStopLoss() <= 0 || breakEvenStop > OrderStopLoss() + breakEvenTick / 2);
+               if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()) || !breakEvenImproves ||
+                  breakEvenMarket - OrderOpenPrice() < BuyBreakEvenATR * breakEvenAtrValue ||
+                  breakEvenGap < MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + breakEvenTick ||
+                  breakEvenGap <= breakEvenFreeze ||
+                  (breakEvenFreeze > 0 && OrderStopLoss() > 0 && MathAbs(breakEvenMarket - OrderStopLoss()) <= breakEvenFreeze))
+               { TC_End(false); continue; }
+               ResetLastError();
+               bool modified = OrderModify(activeTicket, OrderOpenPrice(), breakEvenStop,
+                                           OrderTakeProfit(), 0, clrNONE);
+               int modifyError = GetLastError();
+               gReleasePending = !TC_End(true);
+               if(modified) continue;
                Print(gLogIdentity, "event=BREAK_EVEN_FAILED message=", "Break-even SL failed ticket=", activeTicket,
-                     " error=", GetLastError());
+                     " error=", modifyError);
             }
          }
       }
@@ -722,33 +846,32 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
                (trailFreeze <= 0 || OrderStopLoss() <= 0 ||
                 MathAbs(trailMarket - OrderStopLoss()) > trailFreeze))
             {
-               if(!OrderModify(activeTicket, OrderOpenPrice(), trailStop,
-                               OrderTakeProfit(), 0, clrNONE))
-                  Print(gLogIdentity, "event=TRAIL_MODIFY_FAILED message=", "Trailing SL failed ticket=", activeTicket, " error=", GetLastError());
+               if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) continue;
+               RefreshRates();
+               if(!OrderSelect(activeTicket, SELECT_BY_TICKET) || OrderCloseTime() != 0 ||
+                  OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC || OrderType() != side)
+               { TC_End(false); continue; }
+               trailMarket = (side == OP_BUY ? Bid : Ask);
+               trailGap = (side == OP_BUY ? trailMarket - trailStop : trailStop - trailMarket);
+               trailFreeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
+               improves = (OrderStopLoss() <= 0 || (side == OP_BUY ? trailStop > OrderStopLoss() + trailTick / 2 :
+                                                                              trailStop < OrderStopLoss() - trailTick / 2));
+               favorable = (side == OP_BUY ? trailMarket - OrderOpenPrice() : OrderOpenPrice() - trailMarket);
+               if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()) || !improves || favorable < trailDistance ||
+                  trailGap < MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + trailTick || trailGap <= trailFreeze ||
+                  (trailFreeze > 0 && OrderStopLoss() > 0 && MathAbs(trailMarket - OrderStopLoss()) <= trailFreeze))
+               { TC_End(false); continue; }
+               ResetLastError();
+               bool modified = OrderModify(activeTicket, OrderOpenPrice(), trailStop,
+                                           OrderTakeProfit(), 0, clrNONE);
+               int modifyError = GetLastError();
+               gReleasePending = !TC_End(true);
+               if(!modified)
+                  Print(gLogIdentity, "event=TRAIL_MODIFY_FAILED message=", "Trailing SL failed ticket=", activeTicket, " error=", modifyError);
             }
          }
       }
-      if(exitTicket != activeTicket || exitAttempted) continue;
-      exitAttempted = true;
-      RefreshRates();
-      double price = (side == OP_BUY ? Bid : Ask);
-      double freeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
-      if(freeze > 0 && OrderStopLoss() > 0 && MathAbs(price - OrderStopLoss()) <= freeze) continue;
-      if(OrderClose(activeTicket, OrderLots(), price, Slippage, clrNONE))
-      {
-         lastClose = TimeCurrent();
-         exitTicket = -1;
-         if(stopTicket == activeTicket) stopTicket = -1;
-         if(!IsTesting())
-         {
-            GlobalVariableSet(statePrefix + ".close", lastClose);
-            GlobalVariableSet(activePrefix + ".closed", lastClose);
-            GlobalVariableDel(activePrefix + ".exit");
-            GlobalVariableDel(activePrefix + ".stop");
-            GlobalVariablesFlush();
-         }
-      }
-      else Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", activeTicket, " error=", GetLastError());
+      if(exitTicket == activeTicket && !exitAttempted) RetryPendingExit(exitAttempted);
    }
    // 照合に失敗した場合は、注文がないと断定せず新規発注を見送る。
    if(!orderScanOk) return false;
@@ -942,6 +1065,19 @@ void OpenTokyoPosition(const datetime now, const double tick,
    // 成否不明・恒久エラーの同日同方向再送を止め、一時エラーの連発を抑える。
    if((tokyoSellWindow ? blockedSellDate : blockedBuyDate) == tokyoDate ||
       TimeCurrent() < nextEntryAttempt) return;
+   if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) return;
+   // 取得後に注文一覧と指定分を再確認する。待機中は日次の発注印を進めない。
+   for(int check = OrdersTotal() - 1; check >= 0; check--)
+   {
+      if(!OrderSelect(check, SELECT_BY_POS, MODE_TRADES)) { TC_End(false); return; }
+      if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC) { TC_End(false); return; }
+   }
+   int currentDate = 0, currentMinute = -1;
+   datetime currentTokyo = 0;
+   bool currentTransition = false;
+   GetTokyoClock(TimeCurrent(), currentTokyo, currentDate, currentMinute, currentTransition);
+   if(currentDate != tokyoDate || currentMinute != (tokyoSellWindow ? 595 : TokyoEntryMinute))
+   { TC_End(false); return; }
    // 指定分内でスプレッドを再判定する。
    RefreshRates();
    long bidPoints = (long)MathRound(Bid / Point);
@@ -950,11 +1086,11 @@ void OpenTokyoPosition(const datetime now, const double tick,
    double pointsPerPip = (Digits == 3 || Digits == 5 ? 10.0 : 1.0);
    // 端数pointは許容せず、入力上限を整数pointへ切り捨てる。
    long maxSpreadPoints = (long)MathFloor(MaxSpreadPips * pointsPerPip + 1e-9);
-   if(spreadPoints > maxSpreadPoints) return;
+   if(Bid <= 0 || Ask < Bid || spreadPoints > maxSpreadPoints) { TC_End(false); return; }
    // SL幅にはシグナル時間足のシフト2のATRを使い、形成中の足を含めない。
-   if(iBars(Symbol(), SignalTimeframe) < ATRPeriod + 3) return;
+   if(iBars(Symbol(), SignalTimeframe) < ATRPeriod + 3) { TC_End(false); return; }
    double atr = iATR(Symbol(), SignalTimeframe, ATRPeriod, 2);
-   if(atr <= 0) return;
+   if(atr <= 0) { TC_End(false); return; }
    int side = (tokyoSellWindow ? OP_SELL : OP_BUY);
 
    // 固定ロット・ATR幅のSLで発注する。ストップ制約を満たせない場合は見送る。
@@ -964,36 +1100,86 @@ void OpenTokyoPosition(const datetime now, const double tick,
                           Digits);
    double minDistance = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick;
    if(stop <= 0 || (side == OP_BUY && Bid - stop < minDistance) ||
-      (side == OP_SELL && stop - Ask < minDistance)) return;
+      (side == OP_SELL && stop - Ask < minDistance)) { TC_End(false); return; }
+   double step = MarketInfo(Symbol(), MODE_LOTSTEP);
+   if(step <= 0 || FixedLots < MarketInfo(Symbol(), MODE_MINLOT) || FixedLots > MarketInfo(Symbol(), MODE_MAXLOT) ||
+      MathAbs(FixedLots / step - MathRound(FixedLots / step)) > 1e-7)
+   { TC_End(false); return; }
    // 必要証拠金を確認する前に、以前の処理で残ったエラーを消しておく。
    ResetLastError();
    double freeAfter = AccountFreeMarginCheck(Symbol(), side, FixedLots);
    if(GetLastError() != 0 || freeAfter <= 0)
    {
+      TC_End(false);
       Print(gLogIdentity, "event=ENTRY_MARGIN_REJECTED message=", "Entry skipped: insufficient margin for FixedLots=", FixedLots);
       return;
    }
    // 処理中に指定分を過ぎた場合も、遅刻発注は行わない。
-   if(TimeCurrent() >= now - TimeSeconds(now) + 60) return;
+   if(TimeCurrent() >= now - TimeSeconds(now) + 60) { TC_End(false); return; }
    // 送信前に保留を永続化する。成否不明や送信中の再起動では再送しない。
    string blockKey = statePrefix + (side == OP_SELL ? ".sellblock" : ".buyblock");
+   int previousBlock = (side == OP_SELL ? blockedSellDate : blockedBuyDate);
    if(side == OP_SELL) blockedSellDate = tokyoDate;
    else blockedBuyDate = tokyoDate;
    if(!IsTesting())
    {
       if(GlobalVariableSet(blockKey, tokyoDate) == 0)
       {
-         Print(gLogIdentity, "event=ENTRY_STATE_SAVE_FAILED message=", "Entry state save failed; entry suspended error=", GetLastError());
+         int saveError = GetLastError();
+         TC_End(false);
+         if(side == OP_SELL) blockedSellDate = previousBlock;
+         else blockedBuyDate = previousBlock;
+         Print(gLogIdentity, "event=ENTRY_STATE_SAVE_FAILED message=", "Entry state save failed; entry suspended error=", saveError);
          return;
       }
       GlobalVariablesFlush();
    }
-   if(TimeCurrent() >= now - TimeSeconds(now) + 60) return;
+   bool sendUnoccupied = true;
+   for(int check = OrdersTotal() - 1; check >= 0; check--)
+   {
+      if(!OrderSelect(check, SELECT_BY_POS, MODE_TRADES)) { sendUnoccupied = false; break; }
+      if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC) { sendUnoccupied = false; break; }
+   }
+   ResetLastError();
+   freeAfter = AccountFreeMarginCheck(Symbol(), side, FixedLots);
+   int marginError = GetLastError();
+   step = MarketInfo(Symbol(), MODE_LOTSTEP);
+   RefreshRates();
+   GetTokyoClock(TimeCurrent(), currentTokyo, currentDate, currentMinute, currentTransition);
+   bidPoints = (long)MathRound(Bid / Point);
+   askPoints = (long)MathRound(Ask / Point);
+   // 保存中に気配が変わるため、成行価格と同じATR幅のSLを直前の価格へ合わせる。
+   entry = (side == OP_BUY ? Ask : Bid);
+   stop = entry + (side == OP_BUY ? -1.0 : 1.0) * StopATR * atr;
+   stop = NormalizeDouble((side == OP_BUY ? MathFloor(stop / tick) : MathCeil(stop / tick)) * tick,
+                          Digits);
+   bool sendValid = sendUnoccupied && marginError == 0 && freeAfter > 0 && step > 0 &&
+                    FixedLots >= MarketInfo(Symbol(), MODE_MINLOT) && FixedLots <= MarketInfo(Symbol(), MODE_MAXLOT) &&
+                    MathAbs(FixedLots / step - MathRound(FixedLots / step)) <= 1e-7 &&
+                    IsTradeAllowed() && (IsTesting() || IsConnected()) && currentDate == tokyoDate &&
+                    currentMinute == (tokyoSellWindow ? 595 : TokyoEntryMinute) && Bid > 0 && Ask >= Bid && stop > 0 &&
+                    askPoints - bidPoints <= maxSpreadPoints &&
+                    (side == OP_BUY ? Bid - stop : stop - Ask) >= MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick;
+   if(!sendValid)
+   {
+      bool cleared = IsTesting() || (previousBlock > 0 ? GlobalVariableSet(blockKey, previousBlock) != 0 :
+                                    !GlobalVariableCheck(blockKey) || GlobalVariableDel(blockKey));
+      if(cleared)
+      {
+         if(side == OP_SELL) blockedSellDate = previousBlock;
+         else blockedBuyDate = previousBlock;
+      }
+      if(!IsTesting()) GlobalVariablesFlush();
+      TC_End(false);
+      return;
+   }
+   ResetLastError();
    int ticket = OrderSend(Symbol(), side, FixedLots, entry, Slippage, stop, 0,
                           COMMENT, MAGIC, 0, clrNONE);
+   int error = GetLastError();
+   gReleasePending = !TC_End(true);
    if(ticket < 0)
    {
-      int error = GetLastError();
       Print(gLogIdentity, "event=ENTRY_FAILED message=", "Entry failed error=", error);
       // 未約定が明確な一時エラーだけ、1秒後以降のティックで再試行する。
       // 128(timeout)等の成否不明と恒久エラーは、当日の同方向を保留したままにする。
@@ -1016,9 +1202,10 @@ void OpenTokyoPosition(const datetime now, const double tick,
       }
       return;
    }
-   if(OrderSelect(ticket,SELECT_BY_TICKET) &&
+   if(!gReleasePending && OrderSelect(ticket,SELECT_BY_TICKET) &&
       (OrderType()==OP_BUY || OrderType()==OP_SELL))
       MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
+   else gEntryMailTicket = ticket;
    // 発注成功後にだけ、保有チケット、固定SL幅、当日の売買実績を更新する。
    stopTicket = ticket;
    stopDistance = StopATR * atr;
@@ -1040,45 +1227,6 @@ void OpenTokyoPosition(const datetime now, const double tick,
          Print(gLogIdentity, "event=SL_STATE_SAVE_FAILED message=", "SL state save failed ticket=", ticket, " error=", GetLastError());
       GlobalVariablesFlush();
    }
-   // 約定価格を取得する。失敗しても補正待ちの状態は残し、後続ティックで扱う。
-   if(!OrderSelect(ticket, SELECT_BY_TICKET))
-   {
-      Print(gLogIdentity, "event=FILL_SELECT_FAILED message=", "Fill OrderSelect failed ticket=", ticket, " error=", GetLastError());
-      return;
-   }
-   double target = OrderOpenPrice() + (side == OP_BUY ? -1.0 : 1.0) * stopDistance;
-   stopTarget = NormalizeDouble((side == OP_BUY ? MathFloor(target / tick) : MathCeil(target / tick)) * tick,
-                                Digits);
    // 約定直後に補正を試み、制約や失敗で未完了なら後続ティックへ引き継ぐ。
-   if(OrderCloseTime() > 0 || MathAbs(OrderStopLoss() - stopTarget) < tick / 2)
-   {
-      stopTicket = -1;
-      if(!IsTesting())
-      {
-         GlobalVariableDel(statePrefix + "." + IntegerToString(ticket) + ".stop");
-         GlobalVariablesFlush();
-      }
-   }
-   else
-   {
-      RefreshRates();
-      double market = (side == OP_BUY ? Bid : Ask);
-      double distance = (side == OP_BUY ? market - stopTarget : stopTarget - market);
-      double freeze = MarketInfo(Symbol(), MODE_FREEZELEVEL) * Point;
-      if(distance >= MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick &&
-         distance > freeze)
-      {
-         if(OrderModify(ticket, OrderOpenPrice(), stopTarget,
-                        OrderTakeProfit(), 0, clrNONE))
-         {
-            stopTicket = -1;
-            if(!IsTesting())
-            {
-               GlobalVariableDel(statePrefix + "." + IntegerToString(ticket) + ".stop");
-               GlobalVariablesFlush();
-            }
-         }
-         else Print(gLogIdentity, "event=SL_MODIFY_FAILED message=", "SL correction failed ticket=", ticket, " error=", GetLastError());
-      }
-   }
+   CorrectPendingStop(tick);
 }
