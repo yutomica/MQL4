@@ -80,6 +80,134 @@ int fileHandle=INVALID_HANDLE;
 datetime gEquityTick=0;
 double gLastEquity=0, gLastBalance=0;
 
+
+// 未呼出しの取消保存待ちと、API呼出し後の結果不明を分ける。
+bool gSendCancelPending=false, gSendFinished=false;
+bool gSendStateReadable=true;
+int gSendKnownTicket=-1;
+string SendRecordKey() { return("R."+MailScope(MAGIC)+"."+DoubleToString(MathAbs(gSendNumber),0)); }
+bool FinishSendRecord()
+{
+   if(!IsTesting())
+   {
+      string key=SendRecordKey();
+      if(gSendKnownTicket>0 && !gSendCancelPending)
+      {
+         // phase 3は成功結果の反映・保存待ち。取消しのphase 2とは区別する。
+         if(GlobalVariableSet(key+".k",gSendKnownTicket)==0 || GlobalVariableSet(key+".p",3)==0) return(false);
+      }
+      else if(GlobalVariableSet(key+".p",2)==0) return(false);
+      if(GlobalVariableSet(gSendKey,-MathAbs(gSendNumber))==0) return(false);
+      GlobalVariablesFlush();
+   }
+   gSendNumber=-MathAbs(gSendNumber); gSendCancelPending=false; gSendFinished=false;
+   return(true);
+}
+bool PrepareSendRecord(const int type,const double lots)
+{
+   gSendKnownTicket=-1; gSendCancelPending=true; gSendFinished=false;
+   if(IsTesting()) { gSendCancelPending=false; return(true); }
+   string key=SendRecordKey();
+   bool ok=GlobalVariableSet(key+".p",0)!=0;
+   ok=GlobalVariableSet(key+".t",(double)TimeCurrent())!=0 && ok;
+   ok=GlobalVariableSet(key+".y",type)!=0 && ok;
+   ok=GlobalVariableSet(key+".l",lots)!=0 && ok;
+   ok=GlobalVariableSet(key+".k",0)!=0 && ok;
+   int count=0;
+   for(int pool=0;pool<2;pool++)
+   {
+      int total=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+      for(int i=0;i<total;i++)
+      {
+         if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) { ok=false; continue; }
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+         if(pool==1 && OrderOpenTime()<TimeCurrent()) continue;
+         if(GlobalVariableSet(key+".b"+IntegerToString(count),OrderTicket())==0 ||
+            GlobalVariableSet(key+".u"+IntegerToString(count),(double)OrderOpenTime())==0 ||
+            GlobalVariableSet(key+".v"+IntegerToString(count),OrderType())==0) ok=false;
+         count++;
+      }
+   }
+   ok=GlobalVariableSet(key+".n",count)!=0 && ok;
+   if(ok) ok=GlobalVariableSet(gSendKey,gSendNumber)!=0;
+   GlobalVariablesFlush();
+   if(!ok) { FinishSendRecord(); return(false); }
+   gSendCancelPending=false;
+   return(true);
+}
+bool CommitSendRecord()
+{
+   if(IsTesting()) return(true);
+   if(GlobalVariableSet(SendRecordKey()+".p",1)==0) { gSendCancelPending=true; FinishSendRecord(); return(false); }
+   GlobalVariablesFlush(); return(true);
+}
+int ResolveSendRecord()
+{
+   if(gSendNumber<=0) return(-1);
+   if(gSendCancelPending) { FinishSendRecord(); return(-1); }
+   string key=SendRecordKey();
+   double phase=1,known=0,when=0,type=-1,lots=0,count=-1;
+   bool metadata=false;
+   if(!IsTesting() && GlobalVariableCheck(key+".p"))
+   {
+      if(!GlobalVariableGet(key+".p",phase)) return(-1);
+      if(phase==0 || phase==2) { gSendCancelPending=true; FinishSendRecord(); return(-1); }
+      if(phase!=1 && phase!=3) return(-1);
+      metadata=GlobalVariableGet(key+".t",when) && GlobalVariableGet(key+".y",type) &&
+               GlobalVariableGet(key+".l",lots) && GlobalVariableGet(key+".n",count) && GlobalVariableGet(key+".k",known);
+      if(!metadata || !MathIsValidNumber(when) || !MathIsValidNumber(type) || !MathIsValidNumber(lots) ||
+         !MathIsValidNumber(count) || count<0 || count!=MathFloor(count) || lots<=0) return(-1);
+   }
+   if(gSendKnownTicket>0) known=gSendKnownTicket;
+   if(known>0)
+   {
+      gSendKnownTicket=(int)known;
+      if(!IsTesting() && GlobalVariableSet(key+".k",known)==0) return(-1);
+      if(OrderSelect((int)known,SELECT_BY_TICKET) && OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC &&
+         (!metadata || OrderType()==(int)type || ((int)type>=OP_BUYLIMIT && OrderType()==((int)type%2))))
+      { if(FinishSendRecord()) return((int)known); return(-1); }
+   }
+   if(gSendFinished) { FinishSendRecord(); return(-1); }
+   string tag="R"+DoubleToString(gSendNumber,0)+"|",legacy=COMMENT+"#"+DoubleToString(gSendNumber,0);
+   int found=-1,matches=0; bool readable=true;
+   for(int pool=0;pool<2;pool++)
+   {
+      int total=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+      for(int i=0;i<total;i++)
+      {
+         if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) { readable=false; continue; }
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+         bool match=StringFind(OrderComment(),tag)==0 || StringFind(OrderComment(),legacy)==0;
+         if(!match && metadata && when>0 && lots>0 && count>=0 && OrderOpenTime()>=(datetime)when &&
+            OrderOpenTime()<=TimeCurrent() && MathAbs(OrderLots()-lots)<1e-8 &&
+            (OrderType()==(int)type || ((int)type>=OP_BUYLIMIT && OrderType()==((int)type%2))))
+         {
+            match=true;
+            int ticket=OrderTicket();
+            for(int j=0;j<(int)count;j++)
+            {
+               double prior=0,priorTime=0,priorType=0;
+               if(!GlobalVariableGet(key+".b"+IntegerToString(j),prior) ||
+                  !GlobalVariableGet(key+".u"+IntegerToString(j),priorTime) ||
+                  !GlobalVariableGet(key+".v"+IntegerToString(j),priorType)) { readable=false; match=false; break; }
+               if((int)prior==ticket || ((datetime)priorTime==OrderOpenTime() && (int)priorType==OrderType()) ||
+                  (OrderType()<=OP_SELL && (int)priorType==OrderType())) match=false; // 既存建玉の部分決済後継を新規約定と誤認しない。
+            }
+         }
+         if(match && OrderTicket()!=found) { found=OrderTicket(); matches++; }
+      }
+   }
+   if(!readable || matches!=1) return(-1);
+   gSendKnownTicket=found;
+   if(!IsTesting() && GlobalVariableSet(key+".k",found)==0) return(-1);
+   if(FinishSendRecord()) return(found);
+   return(-1);
+}
+
+int gInstanceHandle=INVALID_HANDLE;
+bool gTimerEvent=false;
+uint gLastQuoteReceived=0;
+
 int OnInit()
 {
    gInitialized=false;
@@ -94,6 +222,13 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
    }
    if(!TC_Init(TRADE_INTERVAL_MS)) return(INIT_FAILED);
+   if(!IsTesting())
+   {
+      gInstanceHandle=FileOpen("EA.instance."+MailScope(MAGIC)+".lock",FILE_READ|FILE_WRITE|FILE_BIN);
+      if(gInstanceHandle==INVALID_HANDLE) { Print("event=INSTANCE_LOCK_FAILED ea=",COMMENT," error=",GetLastError()); return(INIT_FAILED); }
+      if(!EventSetTimer(1)) return(INIT_FAILED);
+      MailReconcile(COMMENT,MAGIC,false,true);
+   }
    gPipsPoint=Point*((Digits==3 || Digits==5) ? 10.0 : 1.0);
    gStartedTime=TimeCurrent(); gStartedTick=GetTickCount();
    gPreviousBar=0; gPairBar=0; gPairStarted=0; gPairStartedTick=0;
@@ -103,7 +238,7 @@ int OnInit()
    gSendKey="S1S_"+AccountServer()+"_"+IntegerToString(AccountNumber())+"_"+Symbol()+"_"+IntegerToString(MAGIC);
    gSendNumber=0;
    if(!IsTesting() && GlobalVariableCheck(gSendKey) && !GlobalVariableGet(gSendKey,gSendNumber))
-      return(INIT_FAILED);
+      gSendStateReadable=false;
    if(gSendNumber>0){
       gPairState=PAIR_CHECK;
       Print(gLogIdentity,"event=SEND_CHECK_REQUIRED id=",DoubleToString(gSendNumber,0));
@@ -130,6 +265,7 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
    // 終了時は待たない。共通枠を取得できた場合だけ1件取り消し、残件を明示する。
    if(gReleasePending) gReleasePending=!TC_End(true);
    bool called=false;
@@ -148,6 +284,7 @@ void OnDeinit(const int reason)
       FileClose(fileHandle); fileHandle=INVALID_HANDLE;
    }
    Print(gLogIdentity,"event=DEINIT reason=",reason);
+   if(gInstanceHandle!=INVALID_HANDLE) { FileClose(gInstanceHandle); gInstanceHandle=INVALID_HANDLE; }
 }
 
 bool OwnOrder(){ return(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC); }
@@ -166,9 +303,9 @@ bool TicketState(int ticket,int &state)
 // 通常時と終了時に共用する取消処理。実APIは最大1回、未取消/読取失敗ならfalse。
 bool CancelAllPendingOrders(bool &called)
 {
-   bool cleared=true;
+   bool cleared=true, readFailed=false;
    for(int i=OrdersTotal()-1;i>=0;i--){
-      if(!OrderSelect(i,SELECT_BY_POS)) return(false);
+      if(!OrderSelect(i,SELECT_BY_POS)) { readFailed=true; continue; }
       if(!OwnOrder() || OrderType()<OP_BUYLIMIT) continue;
       cleared=false;
       if(called || gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) continue;
@@ -190,7 +327,7 @@ bool CancelAllPendingOrders(bool &called)
       Print(gLogIdentity,"event=TRADE_REQUEST_DONE action=CANCEL ticket=",ticket," error=",error," success=",deleted);
    }
    // API成功だけでは完了扱いにせず、次Tickの注文照合を経て状態を進める。
-   return(cleared);
+   return(cleared && !readFailed);
 }
 
 // 初回計算と送信直前の再確認を共用。1=有効、0=条件不成立、-1=注文を読めない。
@@ -297,7 +434,7 @@ void NotifyFills(){
    for(int i=ArraySize(gEntryMailTickets)-1;i>=0;i--){
       if(!OrderSelect(gEntryMailTickets[i],SELECT_BY_TICKET)) continue;
       if(OwnOrder()){
-         if(OrderType()==OP_BUY || OrderType()==OP_SELL) MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
+         if(OrderType()==OP_BUY || OrderType()==OP_SELL) MailNotifySelected(COMMENT,MAGIC,false);
          else if(OrderCloseTime()==0) continue;
       }
       int last=ArraySize(gEntryMailTickets)-1;
@@ -319,8 +456,23 @@ bool CanModifySelected(int type,double stop,double minimum,double freeze){
 }
 
 // 売買の順序を上から読む。共通枠を待っても、新バー評価や記録は続ける。
+void OnTimer()
+{
+   gTimerEvent=true;
+   OnTick();
+   gTimerEvent=false;
+}
 void OnTick()
 {
+   if(!gTimerEvent) gLastQuoteReceived=GetTickCount();
+   if(gReleasePending) gReleasePending=!TC_End(true);
+   MailReconcile(COMMENT,MAGIC,false,true);
+   bool quoteFresh=!gTimerEvent || (IsConnected() && gLastQuoteReceived!=0 && (uint)(GetTickCount()-gLastQuoteReceived)<=10000);
+   if(!gSendStateReadable && !IsTesting())
+   {
+      double restored=0;
+      if(GlobalVariableGet(gSendKey,restored) && MathIsValidNumber(restored)) { gSendNumber=restored; gSendStateReadable=true; }
+   }
    if(!gInitialized) return;
    bool called=false;
    if(gReleasePending) gReleasePending=!TC_End(true); // 注文は再送せず、解放だけ再試行。
@@ -331,29 +483,25 @@ void OnTick()
 
    // ① 不明なOrderSendを実注文・履歴で探す。見つからないだけでは未送信と断定しない。
    if(gSendNumber>0){
-      string tag=COMMENT+"#"+DoubleToString(gSendNumber,0);
-      int found=-1, foundType=-1;
-      for(int pool=0;pool<2 && found<0;pool++){
-         int total=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
-         for(int i=total-1;i>=0;i--){
-            if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) continue;
-            if(OwnOrder() && StringFind(OrderComment(),tag)==0){ found=OrderTicket(); foundType=OrderType(); break; }
-         }
-      }
-      if(found>0 && (IsTesting() || GlobalVariableSet(gSendKey,-gSendNumber)!=0)){
-         if(!IsTesting()) GlobalVariablesFlush();
-         gSendNumber=-gSendNumber;
+      int found=ResolveSendRecord();
+      if(found>0 && OrderSelect(found,SELECT_BY_TICKET)){
+         int foundType=OrderType();
          if(foundType==OP_BUY || foundType==OP_BUYSTOP) gBuyStopTicket=found;
          else if(foundType==OP_SELL || foundType==OP_SELLSTOP) gSellStopTicket=found;
          gPairState=PAIR_CANCEL; gPairBar=0;
          Print(gLogIdentity,"event=SEND_RECONCILED ticket=",found);
       }
+      else if(gSendNumber<=0) { gPairState=PAIR_CANCEL; gPairBar=0; }
    }
 
    // ② OCOの照合。約定・期限切れなら、残った待機注文を取り消す。
    int buy=0, sell=0;
    bool readable=TicketState(gBuyStopTicket,buy);
    if(!TicketState(gSellStopTicket,sell)) readable=false;
+   if(!readable){
+      gPairBar=0;
+      if(startupReady && !gReleasePending) CancelAllPendingOrders(called);
+   }
    if(readable && buy==2 && sell==2){
       if(gPairState!=PAIR_DOUBLE) Alert(gLogIdentity,"event=OCO_DOUBLE_FILL buyTicket=",gBuyStopTicket," sellTicket=",gSellStopTicket);
       gPairState=PAIR_DOUBLE; gPairBar=0;
@@ -385,7 +533,7 @@ void OnTick()
    }
 
    // ③ 前Tickからの予約だけを送る。順番待ちでは予約や5秒期限を作り直さない。
-   if(readable && startupReady && !called && !gReleasePending &&
+   if(gSendStateReadable && quoteFresh && readable && startupReady && !called && !gReleasePending &&
       (gPairState==PAIR_BUY || gPairState==PAIR_SELL) && TC_Begin()){
       double lots=0;
       int valid=PairConditions(gPairPrice,lots,true);
@@ -406,7 +554,7 @@ void OnTick()
          int type=gPairState==PAIR_BUY ? OP_BUYSTOP : OP_SELLSTOP;
          // 同一EA内だけの送信番号。API前に保存し、応答直後の異常終了にも備える。
          gSendNumber=MathMax(MathAbs(gSendNumber)+1,(double)TimeLocal()*1000.0);
-         if(!IsTesting() && GlobalVariableSet(gSendKey,gSendNumber)==0){
+         if(!PrepareSendRecord(type,gPairLots)){
             TC_End(false); gPairState=PAIR_CHECK;
             Print(gLogIdentity,"event=SEND_SAVE_FAILED");
          }
@@ -419,8 +567,9 @@ void OnTick()
                TimeCurrent()-gPairStarted>(int)MyOrderWaitingTime : (uint)(GetTickCount()-gPairStartedTick)>MyOrderWaitingTime*1000));
             if((!IsTesting() && !IsConnected()) || !legReadable || (type==OP_SELLSTOP && leg!=1) || expired || Ask<=Bid ||
                Ask-Bid>MaxSpreadPips*gPipsPoint || gPairPrice.buy-Ask<minimum || Bid-gPairPrice.sell<minimum){
-               bool cleared=IsTesting() || GlobalVariableSet(gSendKey,-gSendNumber)!=0;
-               if(cleared) gSendNumber=-gSendNumber;
+               gSendCancelPending=true;
+               bool cleared=FinishSendRecord();
+               if(cleared) gSendNumber=-MathAbs(gSendNumber);
                if(!IsTesting()) GlobalVariablesFlush();
                TC_End(false);
                if(!cleared){ gPairState=PAIR_CHECK; gPairBar=0; }
@@ -429,22 +578,25 @@ void OnTick()
             }
             else{
                if(gPairStarted==0){ gPairStarted=TimeCurrent(); gPairStartedTick=GetTickCount(); }
+               if(!CommitSendRecord()) { TC_End(false); gPairState=PAIR_CHECK; return; }
                ResetLastError();
                int ticket=OrderSend(Symbol(),type,gPairLots,type==OP_BUYSTOP ? gPairPrice.buy : gPairPrice.sell,
                                    Slippage,type==OP_BUYSTOP ? gPairPrice.buySL : gPairPrice.sellSL,0,
-                                   COMMENT+"#"+DoubleToString(gSendNumber,0),MAGIC,0,type==OP_BUYSTOP ? clrBlue : clrRed);
+                                   "R"+DoubleToString(gSendNumber,0)+"|"+COMMENT,MAGIC,0,type==OP_BUYSTOP ? clrBlue : clrRed);
                int error=GetLastError();
                gReleasePending=!TC_End(true); called=true;
                Print(gLogIdentity,"event=TRADE_REQUEST_DONE action=SEND ticket=",ticket," error=",error," success=",ticket>0);
                bool unknown=ticket<=0 && (error==0 || error==ERR_NO_RESULT || error==ERR_COMMON_ERROR ||
                                           error==ERR_NO_CONNECTION || error==ERR_TRADE_TIMEOUT);
+               gSendKnownTicket=ticket; gSendFinished=!unknown;
+               if(ticket>0 && !IsTesting()) GlobalVariableSet(SendRecordKey()+".k",ticket);
                bool saved=false;
-               if(!unknown) saved=IsTesting() || GlobalVariableSet(gSendKey,-gSendNumber)!=0;
+               if(!unknown) saved=FinishSendRecord();
                if(unknown){
                   // API前に保存した正の印を保持する。空の注文一覧だけでは再開しない。
                   gPairState=PAIR_CHECK; gPairBar=0;
                }
-               else if(saved) gSendNumber=-gSendNumber;
+               else if(saved) gSendNumber=-MathAbs(gSendNumber);
                else { gPairState=PAIR_CHECK; gPairBar=0; }
                if(!IsTesting()) GlobalVariablesFlush();
                if(ticket>0){
@@ -465,11 +617,11 @@ void OnTick()
    }
 
    // ④ 新バーは一度だけ評価。ここで作った候補の実発注は次Tick以降とする。
-   if(Time[0]!=gPreviousBar){
+   if(!gTimerEvent && Time[0]!=gPreviousBar){
       gPreviousBar=Time[0];
       if(IsTesting() && gEquityTick>0 && (long)TimeCurrent()/86400!=(long)gEquityTick/86400)
          FileWrite(fileHandle,TimeToString(gEquityTick,TIME_DATE|TIME_SECONDS),DoubleToString(gLastEquity,2),DoubleToString(gLastBalance,2));
-      if(gPairState!=PAIR_CHECK && gPairState!=PAIR_DOUBLE && readable){
+      if(gSendStateReadable && gPairState!=PAIR_CHECK && gPairState!=PAIR_DOUBLE && readable){
          Prices candidate;
          ZeroMemory(candidate);
          double lots=0;
@@ -511,7 +663,7 @@ void OnTick()
    double exitFreeze=NormalizeDouble(MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point,Digits);
    int total=OrdersTotal();
    int start=gTimeCursor>=0 && gTimeCursor<total ? gTimeCursor : total-1;
-   for(int offset=0;offset<total && startupReady && !called && !gReleasePending;offset++){
+   for(int offset=0;offset<total && !gTimerEvent && quoteFresh && startupReady && !called && !gReleasePending;offset++){
       int index=(start-offset+total)%total;
       if(!OrderSelect(index,SELECT_BY_POS) || !OwnOrder() || OrderType()>OP_SELL) continue;
       if(iBarShift(NULL,PERIOD_H1,OrderOpenTime())<TimeStopBars || OrderProfit()+OrderSwap()+OrderCommission()>=0) continue;
@@ -529,7 +681,7 @@ void OnTick()
    }
 
    total=OrdersTotal(); start=gHalfCursor>=0 && gHalfCursor<total ? gHalfCursor : 0;
-   for(int offset=0;offset<total && startupReady && !called && !gReleasePending && halfPoints>0;offset++){
+   for(int offset=0;offset<total && !gTimerEvent && quoteFresh && startupReady && !called && !gReleasePending && halfPoints>0;offset++){
       int index=(start+offset)%total;
       if(!OrderSelect(index,SELECT_BY_POS) || !OwnOrder() || OrderType()>OP_SELL) continue;
       string key="";
@@ -570,7 +722,7 @@ void OnTick()
    }
 
    total=OrdersTotal(); start=gTrailCursor>=0 && gTrailCursor<total ? gTrailCursor : total-1;
-   for(int offset=0;offset<total && startupReady && !called && !gReleasePending && trailPoints>0 && exitTick>0 && exitStop>=0 && exitFreeze>=0;offset++){
+   for(int offset=0;offset<total && !gTimerEvent && quoteFresh && startupReady && !called && !gReleasePending && trailPoints>0 && exitTick>0 && exitStop>=0 && exitFreeze>=0;offset++){
       int index=(start-offset+total)%total;
       if(!OrderSelect(index,SELECT_BY_POS) || !OwnOrder() || OrderType()>OP_SELL) continue;
       int ticket=OrderTicket();

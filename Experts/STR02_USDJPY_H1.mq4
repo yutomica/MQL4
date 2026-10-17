@@ -62,23 +62,26 @@ input double MinATRSpreadRatio = 17.5; // 0で無効。ATRとAsk-Bidを同じ価
 input double EntryPullbackATR = 0.2; // 0で従来の成行注文。正値ではATR押し目・戻り指値を発注する。
 
 datetime lastBar     = 0;
+datetime lastExitBar = 0;
 datetime lastTick    = 0;
 double   lastEquity  = 0;
 double   lastBalance = 0;
 int      equityFile  = INVALID_HANDLE;
 bool     entryReady  = false;
 bool     stateHealthy = true;
+int exitRetainTicket=-1; // 配列確保に失敗した既存決済要求を固定領域に保持する。
 string   exitPrefix  = "";
 int      exitTickets[];
-datetime exitRetryTimes[];
+uint exitRetryTimes[];
+bool exitRetried[];
 bool     gReleasePending = false;
 string   gSendKey = "";
 double   gSendNumber = 0;
 bool     gSendHandled = false;
 bool     entryRetryPending = false;
 datetime entryRetryBar = 0;
-datetime entryRetryStarted = 0;
-datetime entryRetryNext = 0;
+bool     entryRetryRetried = false;
+uint     entryRetryStarted = 0, entryRetryCompleted = 0;
 int      entryRetryCmd = -1;
 int      entryRetrySide = -1;
 double   entryRetryLots = 0;
@@ -90,6 +93,134 @@ datetime entryRetryExpiration = 0;
 //+------------------------------------------------------------------+
 //| EA初期化                                                        |
 //+------------------------------------------------------------------+
+
+// 未呼出しの取消保存待ちと、API呼出し後の結果不明を分ける。
+bool gSendCancelPending=false, gSendFinished=false;
+bool gSendStateReadable=true;
+int gSendKnownTicket=-1;
+string SendRecordKey() { return("R."+MailScope(MAGIC)+"."+DoubleToString(MathAbs(gSendNumber),0)); }
+bool FinishSendRecord()
+{
+   if(!IsTesting())
+   {
+      string key=SendRecordKey();
+      if(gSendKnownTicket>0 && !gSendCancelPending)
+      {
+         // phase 3は成功結果の反映・保存待ち。取消しのphase 2とは区別する。
+         if(GlobalVariableSet(key+".k",gSendKnownTicket)==0 || GlobalVariableSet(key+".p",3)==0) return(false);
+      }
+      else if(GlobalVariableSet(key+".p",2)==0) return(false);
+      if(GlobalVariableSet(gSendKey,-MathAbs(gSendNumber))==0) return(false);
+      GlobalVariablesFlush();
+   }
+   gSendNumber=-MathAbs(gSendNumber); gSendCancelPending=false; gSendFinished=false;
+   return(true);
+}
+bool PrepareSendRecord(const int type,const double lots)
+{
+   gSendKnownTicket=-1; gSendCancelPending=true; gSendFinished=false;
+   if(IsTesting()) { gSendCancelPending=false; return(true); }
+   string key=SendRecordKey();
+   bool ok=GlobalVariableSet(key+".p",0)!=0;
+   ok=GlobalVariableSet(key+".t",(double)TimeCurrent())!=0 && ok;
+   ok=GlobalVariableSet(key+".y",type)!=0 && ok;
+   ok=GlobalVariableSet(key+".l",lots)!=0 && ok;
+   ok=GlobalVariableSet(key+".k",0)!=0 && ok;
+   int count=0;
+   for(int pool=0;pool<2;pool++)
+   {
+      int total=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+      for(int i=0;i<total;i++)
+      {
+         if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) { ok=false; continue; }
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+         if(pool==1 && OrderOpenTime()<TimeCurrent()) continue;
+         if(GlobalVariableSet(key+".b"+IntegerToString(count),OrderTicket())==0 ||
+            GlobalVariableSet(key+".u"+IntegerToString(count),(double)OrderOpenTime())==0 ||
+            GlobalVariableSet(key+".v"+IntegerToString(count),OrderType())==0) ok=false;
+         count++;
+      }
+   }
+   ok=GlobalVariableSet(key+".n",count)!=0 && ok;
+   if(ok) ok=GlobalVariableSet(gSendKey,gSendNumber)!=0;
+   GlobalVariablesFlush();
+   if(!ok) { FinishSendRecord(); return(false); }
+   gSendCancelPending=false;
+   return(true);
+}
+bool CommitSendRecord()
+{
+   if(IsTesting()) return(true);
+   if(GlobalVariableSet(SendRecordKey()+".p",1)==0) { gSendCancelPending=true; FinishSendRecord(); return(false); }
+   GlobalVariablesFlush(); return(true);
+}
+int ResolveSendRecord()
+{
+   if(gSendNumber<=0) return(-1);
+   if(gSendCancelPending) { FinishSendRecord(); return(-1); }
+   string key=SendRecordKey();
+   double phase=1,known=0,when=0,type=-1,lots=0,count=-1;
+   bool metadata=false;
+   if(!IsTesting() && GlobalVariableCheck(key+".p"))
+   {
+      if(!GlobalVariableGet(key+".p",phase)) return(-1);
+      if(phase==0 || phase==2) { gSendCancelPending=true; FinishSendRecord(); return(-1); }
+      if(phase!=1 && phase!=3) return(-1);
+      metadata=GlobalVariableGet(key+".t",when) && GlobalVariableGet(key+".y",type) &&
+               GlobalVariableGet(key+".l",lots) && GlobalVariableGet(key+".n",count) && GlobalVariableGet(key+".k",known);
+      if(!metadata || !MathIsValidNumber(when) || !MathIsValidNumber(type) || !MathIsValidNumber(lots) ||
+         !MathIsValidNumber(count) || count<0 || count!=MathFloor(count) || lots<=0) return(-1);
+   }
+   if(gSendKnownTicket>0) known=gSendKnownTicket;
+   if(known>0)
+   {
+      gSendKnownTicket=(int)known;
+      if(!IsTesting() && GlobalVariableSet(key+".k",known)==0) return(-1);
+      if(OrderSelect((int)known,SELECT_BY_TICKET) && OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC &&
+         (!metadata || OrderType()==(int)type || ((int)type>=OP_BUYLIMIT && OrderType()==((int)type%2))))
+      { if(FinishSendRecord()) return((int)known); return(-1); }
+   }
+   if(gSendFinished) { FinishSendRecord(); return(-1); }
+   string tag="R"+DoubleToString(gSendNumber,0)+"|",legacy=COMMENT+"#"+DoubleToString(gSendNumber,0);
+   int found=-1,matches=0; bool readable=true;
+   for(int pool=0;pool<2;pool++)
+   {
+      int total=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+      for(int i=0;i<total;i++)
+      {
+         if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) { readable=false; continue; }
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+         bool match=StringFind(OrderComment(),tag)==0 || StringFind(OrderComment(),legacy)==0;
+         if(!match && metadata && when>0 && lots>0 && count>=0 && OrderOpenTime()>=(datetime)when &&
+            OrderOpenTime()<=TimeCurrent() && MathAbs(OrderLots()-lots)<1e-8 &&
+            (OrderType()==(int)type || ((int)type>=OP_BUYLIMIT && OrderType()==((int)type%2))))
+         {
+            match=true;
+            int ticket=OrderTicket();
+            for(int j=0;j<(int)count;j++)
+            {
+               double prior=0,priorTime=0,priorType=0;
+               if(!GlobalVariableGet(key+".b"+IntegerToString(j),prior) ||
+                  !GlobalVariableGet(key+".u"+IntegerToString(j),priorTime) ||
+                  !GlobalVariableGet(key+".v"+IntegerToString(j),priorType)) { readable=false; match=false; break; }
+               if((int)prior==ticket || ((datetime)priorTime==OrderOpenTime() && (int)priorType==OrderType()) ||
+                  (OrderType()<=OP_SELL && (int)priorType==OrderType())) match=false; // 既存建玉の部分決済後継を新規約定と誤認しない。
+            }
+         }
+         if(match && OrderTicket()!=found) { found=OrderTicket(); matches++; }
+      }
+   }
+   if(!readable || matches!=1) return(-1);
+   gSendKnownTicket=found;
+   if(!IsTesting() && GlobalVariableSet(key+".k",found)==0) return(-1);
+   if(FinishSendRecord()) return(found);
+   return(-1);
+}
+
+int gInstanceHandle=INVALID_HANDLE;
+bool gTimerEvent=false;
+uint gLastQuoteReceived=0;
+
 int OnInit()
 {
 
@@ -102,6 +233,8 @@ int OnInit()
                   IntegerToString((long)GetTickCount()) + " ";
    Print(gLogIdentity, "event=INIT_BEGIN compiled=", __DATETIME__);
    entryRetryPending = false;
+   entryRetryRetried = false;
+   gTimerEvent=false; gLastQuoteReceived=0;
    if(Period() != PERIOD_H1 || TradeSymbol != "USDJPY" ||
       StringSubstr(Symbol(),0,6) != TradeSymbol)
       return(INIT_PARAMETERS_INCORRECT);
@@ -113,6 +246,12 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
 
    if(!TC_Init(2000)) return(INIT_FAILED);
+   if(!IsTesting())
+   {
+      gInstanceHandle=FileOpen("EA.instance."+MailScope(MAGIC)+".lock",FILE_READ|FILE_WRITE|FILE_BIN);
+      if(gInstanceHandle==INVALID_HANDLE) { Print("event=INSTANCE_LOCK_FAILED ea=",COMMENT," error=",GetLastError()); return(INIT_FAILED); }
+      if(!EventSetTimer(1)) return(INIT_FAILED);
+   }
    gReleasePending = false;
 
    // サーバー・銘柄をハッシュ化し、保存キーを63文字以内の英数字で構成する。
@@ -120,13 +259,23 @@ int OnInit()
    uint scopeHash = 2166136261;
    for(int k = 0; k < StringLen(scope); k++)
       scopeHash = (scopeHash ^ (uint)StringGetCharacter(scope, k)) * 16777619;
-   exitPrefix = "STR02." + IntegerToString(AccountNumber()) + "." +
-                IntegerToString(MAGIC) + "." + IntegerToString((int)scopeHash) + ".";
+   string newPrefix = "STR02." + IntegerToString(AccountNumber()) + "." +
+                      IntegerToString(MAGIC) + "." + IntegerToString((int)scopeHash) + ".";
+   if(exitPrefix!=newPrefix)
+   {
+      lastBar=0; lastExitBar=0; lastTick=0; lastEquity=0; lastBalance=0;
+      stateHealthy=true; exitRetainTicket=-1;
+      ArrayResize(exitTickets,0); ArrayResize(exitRetryTimes,0); ArrayResize(exitRetried,0);
+      gSendNumber=0; gSendKnownTicket=-1; gSendCancelPending=false; gSendFinished=false; gSendStateReadable=true;
+      mailLastAttempt=0; mailAttempted=false; mailBaseline=0; ArrayResize(mailPendingTickets,0);
+   }
+   exitPrefix=newPrefix;
+   if(!IsTesting()) MailReconcile(COMMENT,MAGIC,false);
    gSendKey = exitPrefix + "send";
    gSendNumber = 0;
    gSendHandled = false;
    if(!IsTesting() && GlobalVariableCheck(gSendKey) &&
-      !GlobalVariableGet(gSendKey, gSendNumber)) return(INIT_FAILED);
+      !GlobalVariableGet(gSendKey, gSendNumber)) gSendStateReadable=false;
    if(gSendNumber > 0)
       Print(gLogIdentity, "event=SEND_CHECK_REQUIRED id=", DoubleToString(gSendNumber, 0));
    // 実運用では最初の有効なティックで現在足を既処理化する。テスターは従来の開始判定を維持する。
@@ -167,6 +316,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
    if(gReleasePending) gReleasePending = !TC_End(true);
    if(equityFile != INVALID_HANDLE)
    {
@@ -175,44 +325,41 @@ void OnDeinit(const int reason)
          FileWrite(equityFile, TimeToString(lastTick, TIME_DATE | TIME_SECONDS),
                    DoubleToString(AccountEquity(), 2),
                    DoubleToString(AccountBalance(), 2));
-      FileClose(equityFile);
+      FileClose(equityFile); equityFile=INVALID_HANDLE;
    }
    Print(gLogIdentity, "event=DEINIT reason=", reason);
+   if(gInstanceHandle!=INVALID_HANDLE) { FileClose(gInstanceHandle); gInstanceHandle=INVALID_HANDLE; }
 }
 
 //+------------------------------------------------------------------+
 //| ティック処理                                                    |
 //+------------------------------------------------------------------+
+void OnTimer()
+{
+   gTimerEvent=true;
+   OnTick();
+   gTimerEvent=false;
+}
 void OnTick()
 {
+   if(!gTimerEvent) gLastQuoteReceived=GetTickCount();
+   if(gReleasePending) gReleasePending=!TC_End(true);
+   MailReconcile(COMMENT,MAGIC,false);
+   bool quoteFresh=!gTimerEvent || (IsConnected() && gLastQuoteReceived!=0 && (uint)(GetTickCount()-gLastQuoteReceived)<=10000);
+   if(!gSendStateReadable && !IsTesting())
+   {
+      double restored=0;
+      if(GlobalVariableGet(gSendKey,restored) && MathIsValidNumber(restored)) { gSendNumber=restored; gSendStateReadable=true; }
+   }
    if(gReleasePending) gReleasePending = !TC_End(true);
    // 結果不明の新規注文は実注文・履歴と照合する。見つからない間は再送しない。
-   if(gSendNumber > 0)
+   if(gSendNumber>0)
    {
-      string tag = COMMENT + "#" + DoubleToString(gSendNumber, 0);
-      int found = -1;
-      for(int pool = 0; pool < 2 && found < 0; pool++)
+      int found=ResolveSendRecord();
+      if(found>0)
       {
-         int total = (pool == 0 ? OrdersTotal() : OrdersHistoryTotal());
-         for(int index = total - 1; index >= 0; index--)
-         {
-            if(!OrderSelect(index, SELECT_BY_POS, pool == 0 ? MODE_TRADES : MODE_HISTORY)) continue;
-            if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
-               StringFind(OrderComment(), tag) == 0) { found = OrderTicket(); break; }
-         }
-      }
-      if(found > 0 && (IsTesting() || GlobalVariableSet(gSendKey, -gSendNumber) != 0))
-      {
-         gSendNumber = -gSendNumber;
-         entryRetryPending = false;
-         if(!IsTesting()) GlobalVariablesFlush();
-         if(!gSendHandled)
-         {
-            int mailCount = ArraySize(gEntryMailTickets);
-            if(ArrayResize(gEntryMailTickets, mailCount + 1) == mailCount + 1)
-               gEntryMailTickets[mailCount] = found;
-         }
-         Print(gLogIdentity, "event=SEND_RECONCILED ticket=", found);
+         entryRetryPending=false;
+         Print(gLogIdentity,"event=SEND_RECONCILED ticket=",found);
       }
    }
    // 待機注文がBuy/Sellに変わった時だけ通知し、処理済みticketを外す。
@@ -222,7 +369,7 @@ void OnTick()
       if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC)
       {
          if(OrderType()==OP_BUY || OrderType()==OP_SELL)
-            MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
+            MailNotifySelected(COMMENT,MAGIC,false);
          else if(OrderCloseTime()==0)
             continue;
       }
@@ -244,17 +391,30 @@ void OnTick()
    // 新規発注はH1新バーごとに1回だけ判定し、既存ポジションの決済管理は毎ティック実行する。
    datetime bar = iTime(Symbol(), PERIOD_H1, 0);
    bool historyReady = (bar > 0 && iBars(Symbol(), PERIOD_H1) >= 220);
-   if(!entryReady && bar > 0)
+   if(!gTimerEvent && !entryReady && bar > 0)
    {
       lastBar = bar;
       entryReady = true;
    }
-   bool newBar = (bar > 0 && bar != lastBar);
+   bool newBar = (!gTimerEvent && bar > 0 && bar != lastBar);
    if(newBar) lastBar = bar;
    // RSIシグナルには確定済みのH1バーだけを使用する。履歴不足でも保存済み決済要求は処理する。
    double rsi = (historyReady ? iRSI(Symbol(), PERIOD_H1, 2, PRICE_CLOSE, 1) : 0);
    double pip = Point * (Digits == 3 || Digits == 5 ? 10.0 : 1.0);
    int slippage = (int)MathRound(2.0 * pip / Point); // 元の3桁USDJPYの20 points = 2 pips。
+   bool exitSaveHealthy=true;
+   // SL・手動決済も含め、決済したH1バーでは新規候補を作らない。
+   if(newBar || entryRetryPending || !stateHealthy)
+   {
+      for(int h=OrdersHistoryTotal()-1;h>=0;h--)
+      {
+         if(!OrderSelect(h,SELECT_BY_POS,MODE_HISTORY)) { exitSaveHealthy=false; continue; }
+         if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC &&
+            (OrderType()==OP_BUY || OrderType()==OP_SELL) && bar>0 && OrderCloseTime()>=bar)
+            lastExitBar=bar;
+      }
+   }
+   stateHealthy=false;
    bool occupied = false;
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
@@ -277,39 +437,45 @@ void OnTick()
       for(int j = 0; j < ArraySize(exitTickets); j++)
          if(exitTickets[j] == ticket) pendingIndex = j;
       bool savedExit = (!IsTesting() && GlobalVariableCheck(exitKey));
+      if(gTimerEvent && pendingIndex<0 && !savedExit && exitRetainTicket!=ticket) continue;
       bool recovered = historyReady && (side == OP_BUY ? rsi > RSIExit : rsi < 100.0 - RSIExit);
       int heldBars = iBarShift(Symbol(), PERIOD_H1, OrderOpenTime(), false);
-      if(pendingIndex < 0 && !savedExit && !recovered && heldBars < HoldBars)
+      if(pendingIndex < 0 && !savedExit && exitRetainTicket!=ticket && !recovered && heldBars < HoldBars)
          continue;
       if(pendingIndex < 0)
       {
          pendingIndex = ArraySize(exitTickets);
-         if(ArrayResize(exitRetryTimes, pendingIndex + 1) != pendingIndex + 1 ||
+         if(ArrayResize(exitRetried,pendingIndex+1)!=pendingIndex+1 || ArrayResize(exitRetryTimes, pendingIndex + 1) != pendingIndex + 1 ||
             ArrayResize(exitTickets, pendingIndex + 1) != pendingIndex + 1)
          {
+            exitRetainTicket=ticket;
+            if(!IsTesting() && GlobalVariableSet(exitKey,1.0)!=0) GlobalVariablesFlush();
+            ArrayResize(exitRetried,pendingIndex);ArrayResize(exitRetryTimes,pendingIndex);ArrayResize(exitTickets,pendingIndex);
             stateHealthy = false;
             Alert(gLogIdentity, "event=EXIT_REQUEST_RETAIN_FAILED message=", "STR02: cannot retain exit request; new entries blocked. ticket=", ticket);
             return;
          }
          exitTickets[pendingIndex] = ticket;
-         exitRetryTimes[pendingIndex] = 0;
+         if(exitRetainTicket==ticket) exitRetainTicket=-1;
+         exitRetryTimes[pendingIndex] = 0; exitRetried[pendingIndex]=false;
       }
       // 保存失敗でもメモリ上の決済要求は維持する。新規発注を停止し、次の再試行時にも保存を試みる。
-      if(now < exitRetryTimes[pendingIndex]) continue;
       if(!IsTesting() && !savedExit)
       {
          ResetLastError();
          if(GlobalVariableSet(exitKey, 1.0) == 0)
          {
-            stateHealthy = false;
+            exitSaveHealthy=false;
             Alert(gLogIdentity, "event=EXIT_STATE_SAVE_FAILED message=", "STR02: exit state save failed; new entries blocked. ticket=", ticket,
                   " error=", GetLastError());
          }
          else
             GlobalVariablesFlush();
       }
+      uint retryNow=IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount();
+      if(exitRetried[pendingIndex] && (uint)(retryNow-exitRetryTimes[pendingIndex])<5000) continue;
       // 自動売買禁止・通信断・他EAの取引処理中でも、決済要求を取り消さず次のティックへ持ち越す。
-      if(gReleasePending || !IsTradeAllowed() || (!IsTesting() && !IsConnected()) || !TC_Begin())
+      if(!quoteFresh || gReleasePending || !IsTradeAllowed() || (!IsTesting() && !IsConnected()) || !TC_Begin())
          continue;
       RefreshRates();
       // 再試行直前にチケットを再選択し、SL約定・手動決済済みの注文を再送しない。
@@ -335,15 +501,18 @@ void OnTick()
       bool closed = OrderClose(ticket, OrderLots(), price, slippage, clrNONE);
       int closeError = GetLastError();
       gReleasePending = !TC_End(true);
-      exitRetryTimes[pendingIndex] = TimeCurrent() + 5;
+      exitRetryTimes[pendingIndex] = IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount();
+      exitRetried[pendingIndex]=true;
       if(!closed)
          Print(gLogIdentity, "event=EXIT_FAILED message=", "Exit failed ticket=", ticket, " error=", closeError, "; retry after >=5 seconds");
       else
       {
+         lastExitBar=iTime(Symbol(),PERIOD_H1,0);
          exitTickets[pendingIndex] = exitTickets[ArraySize(exitTickets) - 1];
          exitRetryTimes[pendingIndex] = exitRetryTimes[ArraySize(exitTickets) - 1];
+         exitRetried[pendingIndex]=exitRetried[ArraySize(exitTickets)-1];
          ArrayResize(exitTickets, ArraySize(exitTickets) - 1);
-         ArrayResize(exitRetryTimes, ArraySize(exitTickets));
+         ArrayResize(exitRetryTimes, ArraySize(exitTickets)); ArrayResize(exitRetried,ArraySize(exitTickets));
          if(!IsTesting() && GlobalVariableCheck(exitKey))
          {
             if(!GlobalVariableDel(exitKey))
@@ -352,12 +521,19 @@ void OnTick()
          }
       }
    }
-   if(entryRetryPending && (!historyReady || !AllowNewEntries || !stateHealthy || occupied ||
-      bar != entryRetryBar || (entryRetryStarted > 0 && now > entryRetryStarted + 5) ||
+   if(exitRetainTicket>0)
+   {
+      if(OrderSelect(exitRetainTicket,SELECT_BY_TICKET) && OrderCloseTime()>0) exitRetainTicket=-1;
+      else exitSaveHealthy=false;
+   }
+   stateHealthy=exitSaveHealthy; // 全注文を確認し、保存待ちが解消したイベントだけ復帰する。
+   uint retryClock=IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount();
+   if(entryRetryPending && (!historyReady || !AllowNewEntries || !stateHealthy || occupied || lastExitBar>=bar ||
+      bar != entryRetryBar || (entryRetryRetried && (uint)(retryClock-entryRetryStarted)>5000) ||
       (entryRetryExpiration > 0 && now >= entryRetryExpiration)))
       entryRetryPending = false;
    // このEAのポジションがある場合、そのバーでは新規エントリーしない。決済したバーも再発注しない。
-   if(!entryRetryPending && gSendNumber <= 0 && !occupied && newBar && historyReady && AllowNewEntries && stateHealthy)
+   if(!entryRetryPending && gSendNumber <= 0 && !occupied && lastExitBar<bar && newBar && historyReady && AllowNewEntries && stateHealthy && gSendStateReadable)
    {
       // 他EAの送信中でも候補を保存する。自動売買OFF時は従来どおりそのバーを見送る。
       if((IsTesting() && !IsTradeAllowed()) || (!IsTesting() &&
@@ -434,8 +610,8 @@ void OnTick()
       // 新バーで確定した要求を保存する。未送信では5秒の再送期限を開始しない。
       entryRetryPending = true;
       entryRetryBar = bar;
-      entryRetryStarted = 0;
-      entryRetryNext = 0;
+      entryRetryRetried = false;
+      entryRetryStarted = 0; entryRetryCompleted = 0;
       entryRetryCmd = orderCmd;
       entryRetrySide = side;
       entryRetryLots = lots;
@@ -447,12 +623,12 @@ void OnTick()
    // 初回未送信と8/141の再送を区別し、保存した要求を同じH1バー内で処理する。
    if(entryRetryPending)
    {
-      if(!historyReady || !AllowNewEntries || !stateHealthy || occupied || bar != entryRetryBar || (entryRetryStarted > 0 && now > entryRetryStarted + 5) ||
+      if(!historyReady || !AllowNewEntries || !stateHealthy || occupied || lastExitBar>=bar || bar != entryRetryBar || (entryRetryRetried && (uint)(retryClock-entryRetryStarted)>5000) ||
          (entryRetryExpiration > 0 && now >= entryRetryExpiration))
       {
          entryRetryPending = false;
       }
-      else if(!gReleasePending && gSendNumber <= 0 && now >= entryRetryNext)
+      else if(quoteFresh && gSendStateReadable && !gReleasePending && gSendNumber <= 0 && (!entryRetryRetried || (uint)(retryClock-entryRetryCompleted)>=2000))
       {
          // 送信直前にも安全条件を確認する。指値価格・SL・数量は保持し、成行価格は直前に更新する。
          if(IsTradeAllowed() && (IsTesting() || IsConnected()) && TC_Begin())
@@ -472,7 +648,7 @@ void OnTick()
             bool retryValid = (retryReadable && !retryOccupied && AllowNewEntries && stateHealthy &&
                                iTime(Symbol(), PERIOD_H1, 0) == entryRetryBar &&
                                (entryRetryExpiration == 0 || TimeCurrent() < entryRetryExpiration) &&
-                               (entryRetryStarted == 0 || TimeCurrent() <= entryRetryStarted + 5) &&
+                               (!entryRetryRetried || (uint)((IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount())-entryRetryStarted)<=5000) &&
                                Bid > 0 && Ask > Bid && retryTick > 0 && retryStep > 0 &&
                                Ask - Bid <= MaxSpreadPips * pip &&
                                (MinATRSpreadRatio <= 0 || entryRetryATR >= MinATRSpreadRatio * (Ask - Bid)) &&
@@ -502,57 +678,93 @@ void OnTick()
             }
             else
             {
-               bool retrying = (entryRetryStarted > 0);
+               bool retrying = entryRetryRetried;
                gSendHandled = false;
                gSendNumber = MathMax(MathAbs(gSendNumber) + 1, (double)TimeLocal() * 1000.0);
-               if(!IsTesting() && GlobalVariableSet(gSendKey, gSendNumber) == 0)
+               if(!PrepareSendRecord(entryRetryCmd,entryRetryLots))
                {
                   TC_End(false);
-                  stateHealthy = false;
                   entryRetryPending = false;
                   Print(gLogIdentity, "event=SEND_SAVE_FAILED");
                   return;
                }
-               if(!IsTesting()) GlobalVariablesFlush();
+               if(!CommitSendRecord()) { TC_End(false); entryRetryPending=false; return; }
+               // 永続化の完了後に注文・決済履歴を再走査する。保存中に変わった状態では送らない。
+               bool sendReadable=true,sendOccupied=false;
+               for(int pool=0;pool<2;pool++)
+               {
+                  int count=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+                  for(int check=0;check<count;check++)
+                  {
+                     if(!OrderSelect(check,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY))
+                     { sendReadable=false; continue; }
+                     if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+                     if(pool==0) sendOccupied=true;
+                     else if((OrderType()==OP_BUY || OrderType()==OP_SELL) && OrderCloseTime()>=entryRetryBar)
+                        lastExitBar=entryRetryBar;
+                  }
+               }
                RefreshRates();
-               bool sendValid = iTime(Symbol(), PERIOD_H1, 0) == entryRetryBar &&
+               retryTick=SymbolInfoDouble(Symbol(),SYMBOL_TRADE_TICK_SIZE);
+               retryStep=MarketInfo(Symbol(),MODE_LOTSTEP);
+               retryMinDistance=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point+retryTick;
+               retryCapital=MathMin(AccountBalance(),AccountEquity());
+               bool sendValid = sendReadable && !sendOccupied && lastExitBar<entryRetryBar &&
+                                AllowNewEntries && stateHealthy && gSendStateReadable &&
+                                iTime(Symbol(), PERIOD_H1, 0) == entryRetryBar &&
                                 (entryRetryExpiration == 0 || TimeCurrent() < entryRetryExpiration) &&
-                                (entryRetryStarted == 0 || TimeCurrent() <= entryRetryStarted + 5) &&
-                                Bid > 0 && Ask > Bid && Ask - Bid <= MaxSpreadPips * pip &&
-                                (MinATRSpreadRatio <= 0 || entryRetryATR >= MinATRSpreadRatio * (Ask - Bid));
+                                (!entryRetryRetried || (uint)((IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount())-entryRetryStarted)<=5000) &&
+                                (!gTimerEvent || (gLastQuoteReceived!=0 && (uint)(GetTickCount()-gLastQuoteReceived)<=10000)) &&
+                                Bid > 0 && Ask > Bid && retryTick>0 && retryStep>0 && retryCapital>0 &&
+                                Ask-Bid<=MaxSpreadPips*pip &&
+                                (MinATRSpreadRatio<=0 || entryRetryATR>=MinATRSpreadRatio*(Ask-Bid)) &&
+                                entryRetryLots>=MarketInfo(Symbol(),MODE_MINLOT) &&
+                                entryRetryLots<=MarketInfo(Symbol(),MODE_MAXLOT) &&
+                                MathAbs(entryRetryLots/retryStep-MathRound(entryRetryLots/retryStep))<=1e-8;
                if(entryRetryCmd == OP_BUYLIMIT)
-                  sendValid = sendValid && Ask - entryRetryPrice >= retryMinDistance;
+                  sendValid = sendValid && Ask-entryRetryPrice>=retryMinDistance && entryRetryPrice-entryRetryStop>=retryMinDistance;
                else if(entryRetryCmd == OP_SELLLIMIT)
-                  sendValid = sendValid && entryRetryPrice - Bid >= retryMinDistance;
+                  sendValid = sendValid && entryRetryPrice-Bid>=retryMinDistance && entryRetryStop-entryRetryPrice>=retryMinDistance;
                else
                   sendValid = sendValid && (entryRetrySide == OP_BUY ?
-                              Bid - entryRetryStop : entryRetryStop - Ask) >= retryMinDistance;
-               // 指値は予約価格を維持。成行は最新気配を使い、固定したSL・数量のリスクを再確認する。
+                              Bid-entryRetryStop : entryRetryStop-Ask)>=retryMinDistance;
+               // 指値価格・SL・数量は変更せず、最新の資金・気配・銘柄仕様でリスクを確認する。
                double sendPrice = (entryRetryCmd == OP_BUY ? Ask :
                                    entryRetryCmd == OP_SELL ? Bid : entryRetryPrice);
-               double sendTickValue = MarketInfo(Symbol(), MODE_TICKVALUE);
-               double sendRisk = MathAbs(sendPrice - entryRetryStop) / retryTick * sendTickValue * entryRetryLots;
-               sendValid = sendValid && sendTickValue > 0 &&
-                           sendRisk <= MathMin(AccountBalance(), AccountEquity()) * EntryRiskPercent / 100.0 + 1e-8;
+               double sendTickValue=MarketInfo(Symbol(),MODE_TICKVALUE);
+               double sendRisk=retryTick>0 ? MathAbs(sendPrice-entryRetryStop)/retryTick*sendTickValue*entryRetryLots : -1;
+               sendValid=sendValid && sendTickValue>0 && sendRisk>0 &&
+                         sendRisk<=retryCapital*EntryRiskPercent/100.0+1e-8;
+               ResetLastError();
+               double sendFreeAfter=sendValid ? AccountFreeMarginCheck(Symbol(),entryRetrySide,entryRetryLots) : -1;
+               int sendMarginError=GetLastError();
+               sendValid=sendValid && sendMarginError==0 && sendFreeAfter>=0.3*retryCapital;
+               // 時間判定は口座・注文照会の後にも実施する。実運用は壁時計変更の影響を受けない。
+               uint sendClock=IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount();
+               sendValid=sendValid && (!entryRetryRetried || (uint)(sendClock-entryRetryStarted)<=5000) &&
+                         iTime(Symbol(),PERIOD_H1,0)==entryRetryBar &&
+                         (entryRetryExpiration==0 || TimeCurrent()<entryRetryExpiration);
                if(!sendValid || !IsTradeAllowed() || (!IsTesting() && !IsConnected()))
                {
-                  if(IsTesting() || GlobalVariableSet(gSendKey, -gSendNumber) != 0)
-                     gSendNumber = -gSendNumber;
-                  if(!IsTesting()) GlobalVariablesFlush();
+                  gSendCancelPending=true;
+                  FinishSendRecord();
                   TC_End(false);
-                  entryRetryPending = sendValid && gSendNumber <= 0;
+                  entryRetryPending=sendValid && gSendNumber<=0;
                   return;
                }
                ResetLastError();
                int retryTicket = OrderSend(Symbol(), entryRetryCmd, entryRetryLots,
                                            sendPrice, slippage, entryRetryStop, 0,
-                                           COMMENT + "#" + DoubleToString(gSendNumber, 0), MAGIC, entryRetryExpiration, clrNONE);
+                                           "R" + DoubleToString(gSendNumber, 0) + "|" + COMMENT, MAGIC, entryRetryExpiration, clrNONE);
                int retryError = GetLastError();
+               uint completedClock=IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount();
                gReleasePending = !TC_End(true);
                bool unknown = retryTicket < 0 && (retryError == 0 || retryError == 1 ||
                               retryError == 2 || retryError == 6 || retryError == 128);
-               bool saved = !unknown && (IsTesting() || GlobalVariableSet(gSendKey, -gSendNumber) != 0);
-               if(saved) gSendNumber = -gSendNumber;
+               gSendKnownTicket=retryTicket; gSendFinished=!unknown;
+               if(retryTicket>0 && !IsTesting()) GlobalVariableSet(SendRecordKey()+".k",retryTicket);
+               bool saved = !unknown && FinishSendRecord();
+               if(saved) gSendNumber = -MathAbs(gSendNumber);
                if(!IsTesting()) GlobalVariablesFlush();
                if(retryTicket >= 0)
                {
@@ -569,7 +781,7 @@ void OnTick()
                   int mailCount=ArraySize(gEntryMailTickets);
                   if(!gReleasePending && OrderSelect(retryTicket, SELECT_BY_TICKET) &&
                      (OrderType() == OP_BUY || OrderType() == OP_SELL))
-                     MySendMail(COMMENT, OrderType() == OP_BUY ? 1 : 2);
+                     MailNotifySelected(COMMENT,MAGIC,false);
                   else if(ArrayResize(gEntryMailTickets,mailCount+1)==mailCount+1)
                      gEntryMailTickets[mailCount]=retryTicket;
                }
@@ -579,8 +791,8 @@ void OnTick()
                         "Entry failed error=", retryError);
                   if(saved && entryRetryCmd >= OP_BUYLIMIT && (retryError == 8 || retryError == 141))
                   {
-                     if(entryRetryStarted == 0) entryRetryStarted = TimeCurrent();
-                     entryRetryNext = TimeCurrent() + 2;
+                     if(!entryRetryRetried) entryRetryStarted=completedClock;
+                     entryRetryRetried=true; entryRetryCompleted=completedClock;
                   }
                   else
                      entryRetryPending = false;

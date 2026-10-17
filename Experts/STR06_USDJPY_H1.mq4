@@ -45,7 +45,7 @@ sinput bool UseUSDST = true; // 米国の夏時間日程でサーバー時差を
 
 // 最適化対象：突破期間・初期損切り幅・追尾幅・保有期限。
 input int ChannelBars = 16; // 確定足の高値・安値チャネル期間
-input double StopATR = 3.0; // 初期損切り幅のATR倍率
+input double StopATR = 1.0; // 初期損切り幅のATR倍率
 input double TrailATR = 2.0; // 終値極値からの追尾幅のATR倍率
 input int HoldBars = 24; // 約定足から数えた最大保有バー数
 
@@ -60,6 +60,10 @@ double gTrailStop = 0;
 bool gEntryReady = false, gStateHealthy = true;
 int gExitTickets[];
 datetime gExitRetryTimes[];
+// テスター内だけで日次の有効証拠金・残高を記録する。
+int gEquityFile = INVALID_HANDLE;
+datetime gEquityLastTick = 0;
+double gEquityLastValue = 0, gEquityLastBalance = 0;
 
 //+------------------------------------------------------------------+
 //| 初期化：入力確認と売買状態の復元                                 |
@@ -105,8 +109,46 @@ int OnInit()
          if(currentBar>0 && (OrderType()==OP_BUY || OrderType()==OP_SELL) && OrderCloseTime()>=currentBar) gLastExitBar=currentBar;
       }
    }
+   if(IsTesting())
+   {
+      gEquityLastTick=0;gEquityLastValue=0;gEquityLastBalance=0;
+      string equityName=COMMENT+"_equity_"+IntegerToString((long)TimeLocal())+"_"+
+                        IntegerToString((long)GetTickCount())+".csv";
+      ResetLastError();
+      gEquityFile=FileOpen(equityName,FILE_WRITE|FILE_CSV|FILE_ANSI,',');
+      if(gEquityFile==INVALID_HANDLE)
+      {
+         Print(gLogIdentity,"event=EQUITY_FILE_OPEN_FAILED error=",GetLastError());
+         return(INIT_FAILED);
+      }
+      ResetLastError();
+      if(FileWrite(gEquityFile,"time","equity","balance")==0)
+      {
+         Print(gLogIdentity,"event=EQUITY_FILE_WRITE_FAILED error=",GetLastError());
+         FileClose(gEquityFile);gEquityFile=INVALID_HANDLE;
+         return(INIT_FAILED);
+      }
+   }
    gEntryReady=IsTesting();
    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| テスターの日次出力を完了する                                     |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(IsTesting() && gEquityFile!=INVALID_HANDLE)
+   {
+      if(gEquityLastTick>0)
+      {
+         ResetLastError();
+         if(FileWrite(gEquityFile,TimeToString(gEquityLastTick,TIME_DATE|TIME_SECONDS),
+                      DoubleToString(AccountEquity(),2),DoubleToString(AccountBalance(),2))==0)
+            Print(gLogIdentity,"event=EQUITY_FILE_WRITE_FAILED error=",GetLastError());
+      }
+      FileClose(gEquityFile);gEquityFile=INVALID_HANDLE;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -116,6 +158,20 @@ void OnTick()
 {
    // サーバー時刻をUTCへ換算し、金曜20時以降と週末の全決済条件を判定する
    datetime now=TimeCurrent();
+   if(IsTesting() && gEquityFile!=INVALID_HANDLE)
+   {
+      // サーバー日付の変化時に、前日の最終ティックで保存した値を書き出す。
+      if(gEquityLastTick>0 && (long)now/86400!=(long)gEquityLastTick/86400)
+      {
+         ResetLastError();
+         if(FileWrite(gEquityFile,TimeToString(gEquityLastTick,TIME_DATE|TIME_SECONDS),
+                      DoubleToString(gEquityLastValue,2),DoubleToString(gEquityLastBalance,2))==0)
+            Print(gLogIdentity,"event=EQUITY_FILE_WRITE_FAILED error=",GetLastError());
+      }
+      gEquityLastTick=now;
+      gEquityLastValue=AccountEquity();
+      gEquityLastBalance=AccountBalance();
+   }
    int y=TimeYear(now-BrokerWinterUTCOffset*3600);
    datetime mar=StrToTime(IntegerToString(y)+".03.01 09:00"),nov=StrToTime(IntegerToString(y)+".11.01 09:00");
    datetime ds=mar+(7-TimeDayOfWeek(mar))%7*86400+7*86400,de=nov+(7-TimeDayOfWeek(nov))%7*86400;

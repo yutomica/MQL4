@@ -102,6 +102,313 @@ string tokyoHolidays = ",20210101,20210111,20210211,20210223,20210320,20210429,2
 //+------------------------------------------------------------------+
 //| EA初期化                                                         |
 //+------------------------------------------------------------------+
+
+string gLegacyPrefix="";
+datetime gLegacyPartialOpenTime=0;
+void ReconcileLegacyState()
+{
+   if(IsTesting() || !gLegacyStateUncertain || !IsConnected()) return;
+   double buyBlock=0,sellBlock=0,oldHeld=0;
+   if((GlobalVariableCheck(gLegacyPrefix+".buyblock") && !GlobalVariableGet(gLegacyPrefix+".buyblock",buyBlock)) ||
+      (GlobalVariableCheck(gLegacyPrefix+".sellblock") && !GlobalVariableGet(gLegacyPrefix+".sellblock",sellBlock)) ||
+      (GlobalVariableCheck(gLegacyPrefix+".held") && !GlobalVariableGet(gLegacyPrefix+".held",oldHeld))) return;
+   if(!MathIsValidNumber(buyBlock) || !MathIsValidNumber(sellBlock) || !MathIsValidNumber(oldHeld) ||
+      buyBlock<0 || sellBlock<0 || oldHeld<0 || buyBlock!=MathFloor(buyBlock) ||
+      sellBlock!=MathFloor(sellBlock) || oldHeld!=MathFloor(oldHeld)) return;
+   bool heldFound=oldHeld<=0,buyFound=buyBlock<=0,sellFound=sellBlock<=0,readable=true;
+   datetime activeSell=0;
+   int activeSellDate=0;
+   for(int pool=0;pool<2;pool++)
+   {
+      int count=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+      for(int i=0;i<count;i++)
+      {
+         if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) { readable=false; continue; }
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC || (OrderType()!=OP_BUY && OrderType()!=OP_SELL)) continue;
+         if(OrderTicket()==(int)oldHeld) heldFound=true;
+         datetime tokyo=0; int date=0,minute=0; bool transition=false;
+         GetTokyoClock(OrderOpenTime(),tokyo,date,minute,transition);
+         if(OrderType()==OP_BUY)
+         { lastTokyoEntryDate=(int)MathMax(lastTokyoEntryDate,date); if(date==(int)buyBlock) buyFound=true; }
+         else
+         { lastTokyoSellDate=(int)MathMax(lastTokyoSellDate,date); if(date==(int)sellBlock) sellFound=true; }
+         if(OrderCloseTime()>lastClose) lastClose=OrderCloseTime();
+         if(pool==0 && OrderType()==OP_SELL) { activeSell=OrderOpenTime(); activeSellDate=date; }
+      }
+   }
+   if(!readable) return;
+   // 旧部分決済状態はコピーしない。同じentry時刻の決済履歴があれば部分決済済みと確認する。
+   if(activeSell>0)
+   {
+      bool splitConfirmed=false;
+      for(int h=0;h<OrdersHistoryTotal();h++)
+      {
+         if(!OrderSelect(h,SELECT_BY_POS,MODE_HISTORY)) { readable=false; continue; }
+         if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC && OrderType()==OP_SELL &&
+            OrderOpenTime()==activeSell && OrderCloseTime()>0) splitConfirmed=true;
+      }
+      if(splitConfirmed) lastTokyoSellPartialDate=(int)MathMax(lastTokyoSellPartialDate,activeSellDate);
+      else gLegacyPartialOpenTime=activeSell;
+   }
+   if(!readable) return;
+   // 旧記録だけでは拒否と成否不明を区別できない。未約定を確認した過去日だけ明示的に復旧する。
+   // 確認用GVはEAが作らず、口座・サーバー・銘柄・方向と旧要求日が一致する場合だけ読む。
+   datetime currentTokyo=0; int currentDate=0,currentMinute=0; bool currentTransition=false;
+   GetTokyoClock(TimeCurrent(),currentTokyo,currentDate,currentMinute,currentTransition);
+   string clearKeys[2]; clearKeys[0]=statePrefix+".legacyBuyClear"; clearKeys[1]=statePrefix+".legacySellClear";
+   double blocks[2]; blocks[0]=buyBlock; blocks[1]=sellBlock;
+   for(int direction=0;direction<2;direction++)
+   {
+      if(blocks[direction]<=0 || (direction==0 ? buyFound : sellFound)) continue;
+      double verified=0;
+      if(blocks[direction]<currentDate && GlobalVariableCheck(clearKeys[direction]) &&
+         GlobalVariableGet(clearKeys[direction],verified) && MathIsValidNumber(verified) &&
+         verified==blocks[direction])
+      {
+         if(direction==0) buyFound=true; else sellFound=true;
+      }
+   }
+   bool saved=GlobalVariableSet(statePrefix+".tokyo",lastTokyoEntryDate)!=0;
+   saved=GlobalVariableSet(statePrefix+".tokyosell",lastTokyoSellDate)!=0 && saved;
+   saved=GlobalVariableSet(statePrefix+".sellpartial",lastTokyoSellPartialDate)!=0 && saved;
+   saved=GlobalVariableSet(statePrefix+".close",lastClose)!=0 && saved;
+   if(activeSell>0 && gLegacyPartialOpenTime==activeSell)
+      saved=GlobalVariableSet(statePrefix+".legacyPartial",(double)activeSell)!=0 && saved;
+   GlobalVariablesFlush();
+   if(saved && heldFound && buyFound && sellFound)
+   {
+      if(GlobalVariableSet(statePrefix+".migrated",1)==0) return;
+      GlobalVariablesFlush(); gLegacyStateUncertain=false;
+      Print(gLogIdentity,"event=LEGACY_STATE_RECONCILED message=state reconciled with account orders/history or explicit unfilled confirmation");
+   }
+}
+
+string gSendKey="";
+double gSendNumber=0;
+bool gLegacyStateUncertain=false;
+// 未呼出しの取消保存待ちと、API呼出し後の結果不明を分ける。
+bool gSendCancelPending=false, gSendFinished=false;
+bool gSendStateReadable=true;
+int gSendKnownTicket=-1;
+string SendRecordKey() { return("R."+MailScope(MAGIC)+"."+DoubleToString(MathAbs(gSendNumber),0)); }
+bool FinishSendRecord()
+{
+   if(!IsTesting())
+   {
+      string key=SendRecordKey();
+      if(gSendKnownTicket>0 && !gSendCancelPending)
+      {
+         // phase 3は成功結果の反映・保存待ち。取消しのphase 2とは区別する。
+         if(GlobalVariableSet(key+".k",gSendKnownTicket)==0 || GlobalVariableSet(key+".p",3)==0) return(false);
+
+         // 成功結果を戦略状態へ反映してから、要求を完了する。
+         if(!OrderSelect(gSendKnownTicket,SELECT_BY_TICKET) || OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) return(false);
+         datetime tokyo=0; int day=0,minute=0; bool transition=false;
+         GetTokyoClock(OrderOpenTime(),tokyo,day,minute,transition);
+         string prefix=statePrefix+"."+IntegerToString(gSendKnownTicket);
+         double width=0;
+         if(!GlobalVariableGet(key+".w",width) || !MathIsValidNumber(width) || width<=0) return(false);
+         if(GlobalVariableSet(statePrefix+".held",gSendKnownTicket)==0 ||
+            GlobalVariableSet(statePrefix+(OrderType()==OP_BUY ? ".tokyo" : ".tokyosell"),day)==0) return(false);
+         if(OrderCloseTime()==0)
+         {
+            if(!GlobalVariableCheck(prefix+".stop") && GlobalVariableSet(prefix+".stop",width)==0) return(false);
+         }
+         else if(GlobalVariableSet(prefix+".closed",(double)OrderCloseTime())==0 ||
+                 GlobalVariableSet(statePrefix+".close",(double)MathMax(lastClose,OrderCloseTime()))==0) return(false);
+         heldTicket=gSendKnownTicket;
+         if(OrderType()==OP_BUY) lastTokyoEntryDate=(int)MathMax(lastTokyoEntryDate,day);
+         else lastTokyoSellDate=(int)MathMax(lastTokyoSellDate,day);
+      }
+      else
+      {
+         if(GlobalVariableSet(key+".p",gSendCancelPending ? 2 : 4)==0) return(false);
+         GlobalVariablesFlush();
+         if(gSendCancelPending && GlobalVariableCheck(key+".prev"))
+         {
+            double previous=0,type=-1;
+            if(!GlobalVariableGet(key+".prev",previous) || !GlobalVariableGet(key+".y",type)) return(false);
+            if(GlobalVariableSet(statePrefix+((int)type==OP_SELL ? ".sellblock" : ".buyblock"),previous)==0) return(false);
+            if((int)type==OP_SELL) blockedSellDate=(int)previous; else blockedBuyDate=(int)previous;
+         }
+      }
+      if(GlobalVariableSet(gSendKey,-MathAbs(gSendNumber))==0) return(false);
+      GlobalVariablesFlush();
+   }
+   gSendNumber=-MathAbs(gSendNumber); gSendCancelPending=false; gSendFinished=false;
+   return(true);
+}
+bool PrepareSendRecord(const int type,const double lots)
+{
+   gSendKnownTicket=-1; gSendCancelPending=true; gSendFinished=false;
+   if(IsTesting()) { gSendCancelPending=false; return(true); }
+   string key=SendRecordKey();
+   bool ok=GlobalVariableSet(key+".p",0)!=0;
+   ok=GlobalVariableSet(key+".t",(double)TimeCurrent())!=0 && ok;
+   ok=GlobalVariableSet(key+".y",type)!=0 && ok;
+   ok=GlobalVariableSet(key+".l",lots)!=0 && ok;
+   ok=GlobalVariableSet(key+".k",0)!=0 && ok;
+   int count=0;
+   for(int pool=0;pool<2;pool++)
+   {
+      int total=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+      for(int i=0;i<total;i++)
+      {
+         if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) { ok=false; continue; }
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+         if(pool==1 && OrderOpenTime()<TimeCurrent()) continue;
+         if(GlobalVariableSet(key+".b"+IntegerToString(count),OrderTicket())==0 ||
+            GlobalVariableSet(key+".u"+IntegerToString(count),(double)OrderOpenTime())==0 ||
+            GlobalVariableSet(key+".v"+IntegerToString(count),OrderType())==0) ok=false;
+         count++;
+      }
+   }
+   ok=GlobalVariableSet(key+".n",count)!=0 && ok;
+   if(ok) ok=GlobalVariableSet(gSendKey,gSendNumber)!=0;
+   GlobalVariablesFlush();
+   if(!ok) { FinishSendRecord(); return(false); }
+   gSendCancelPending=false;
+   return(true);
+}
+bool CommitSendRecord()
+{
+   if(IsTesting()) return(true);
+   if(GlobalVariableSet(SendRecordKey()+".p",1)==0) { gSendCancelPending=true; FinishSendRecord(); return(false); }
+   GlobalVariablesFlush(); return(true);
+}
+int ResolveSendRecord()
+{
+   if(gSendNumber<=0) return(-1);
+   if(gSendCancelPending) { FinishSendRecord(); return(-1); }
+   string key=SendRecordKey();
+   double phase=1,known=0,when=0,type=-1,lots=0,count=-1;
+   bool metadata=false;
+   if(!IsTesting() && GlobalVariableCheck(key+".p"))
+   {
+      if(!GlobalVariableGet(key+".p",phase)) return(-1);
+      if(phase==0 || phase==2) { gSendCancelPending=true; FinishSendRecord(); return(-1); }
+      if(phase==4) { gSendFinished=true; FinishSendRecord(); return(-1); }
+      if(phase!=1 && phase!=3) return(-1);
+      metadata=GlobalVariableGet(key+".t",when) && GlobalVariableGet(key+".y",type) &&
+               GlobalVariableGet(key+".l",lots) && GlobalVariableGet(key+".n",count) && GlobalVariableGet(key+".k",known);
+      if(!metadata || !MathIsValidNumber(when) || !MathIsValidNumber(type) || !MathIsValidNumber(lots) ||
+         !MathIsValidNumber(count) || count<0 || count!=MathFloor(count) || lots<=0) return(-1);
+   }
+   if(gSendKnownTicket>0) known=gSendKnownTicket;
+   if(known>0)
+   {
+      gSendKnownTicket=(int)known;
+      if(!IsTesting() && GlobalVariableSet(key+".k",known)==0) return(-1);
+      if(OrderSelect((int)known,SELECT_BY_TICKET) && OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC &&
+         (!metadata || OrderType()==(int)type || ((int)type>=OP_BUYLIMIT && OrderType()==((int)type%2))))
+      { if(FinishSendRecord()) return((int)known); return(-1); }
+   }
+   if(gSendFinished) { FinishSendRecord(); return(-1); }
+   string tag="R"+DoubleToString(gSendNumber,0)+"|",legacy=COMMENT+"#"+DoubleToString(gSendNumber,0);
+   int found=-1,matches=0; bool readable=true;
+   for(int pool=0;pool<2;pool++)
+   {
+      int total=pool==0 ? OrdersTotal() : OrdersHistoryTotal();
+      for(int i=0;i<total;i++)
+      {
+         if(!OrderSelect(i,SELECT_BY_POS,pool==0 ? MODE_TRADES : MODE_HISTORY)) { readable=false; continue; }
+         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
+         bool match=StringFind(OrderComment(),tag)==0 || StringFind(OrderComment(),legacy)==0;
+         if(!match && metadata && when>0 && lots>0 && count>=0 && OrderOpenTime()>=(datetime)when &&
+            OrderOpenTime()<=TimeCurrent() && MathAbs(OrderLots()-lots)<1e-8 &&
+            (OrderType()==(int)type || ((int)type>=OP_BUYLIMIT && OrderType()==((int)type%2))))
+         {
+            match=true;
+            int ticket=OrderTicket();
+            for(int j=0;j<(int)count;j++)
+            {
+               double prior=0,priorTime=0,priorType=0;
+               if(!GlobalVariableGet(key+".b"+IntegerToString(j),prior) ||
+                  !GlobalVariableGet(key+".u"+IntegerToString(j),priorTime) ||
+                  !GlobalVariableGet(key+".v"+IntegerToString(j),priorType)) { readable=false; match=false; break; }
+               if((int)prior==ticket || ((datetime)priorTime==OrderOpenTime() && (int)priorType==OrderType()) ||
+                  (OrderType()<=OP_SELL && (int)priorType==OrderType())) match=false; // 既存建玉の部分決済後継を新規約定と誤認しない。
+            }
+         }
+         if(match && OrderTicket()!=found) { found=OrderTicket(); matches++; }
+      }
+   }
+   if(!readable || matches!=1) return(-1);
+   gSendKnownTicket=found;
+   if(!IsTesting() && GlobalVariableSet(key+".k",found)==0) return(-1);
+   if(FinishSendRecord()) return(found);
+   return(-1);
+}
+
+
+
+string gStopSaveKeys[];
+double gStopSaveValues[];
+int gSplitStopCompletedDate=0;
+int gStopCompletedTickets[];
+void RememberCompletedStop(const int ticket)
+{
+   for(int i=0;i<ArraySize(gStopCompletedTickets);i++) if(gStopCompletedTickets[i]==ticket) return;
+   int n=ArraySize(gStopCompletedTickets);
+   if(ArrayResize(gStopCompletedTickets,n+1)==n+1) gStopCompletedTickets[n]=ticket;
+}
+void SaveStopCompletion(const string key,const double value)
+{
+   if(IsTesting()) return;
+   if(GlobalVariableSet(key,value)!=0) { GlobalVariablesFlush(); return; }
+   for(int i=0;i<ArraySize(gStopSaveKeys);i++) if(gStopSaveKeys[i]==key) return;
+   int n=ArraySize(gStopSaveKeys);
+   bool keysOk=ArrayResize(gStopSaveKeys,n+1)==n+1;
+   bool valuesOk=ArrayResize(gStopSaveValues,n+1)==n+1;
+   if(keysOk && valuesOk) { gStopSaveKeys[n]=key; gStopSaveValues[n]=value; }
+   else { ArrayResize(gStopSaveKeys,n); ArrayResize(gStopSaveValues,n); }
+   Print(gLogIdentity,"event=SL_COMPLETION_SAVE_PENDING key=",key," error=",GetLastError());
+}
+void RetryStopCompletion()
+{
+   for(int i=ArraySize(gStopSaveKeys)-1;i>=0;i--)
+   {
+      if(GlobalVariableSet(gStopSaveKeys[i],gStopSaveValues[i])==0) continue;
+      int n=ArraySize(gStopSaveKeys)-1;
+      gStopSaveKeys[i]=gStopSaveKeys[n]; gStopSaveValues[i]=gStopSaveValues[n];
+      ArrayResize(gStopSaveKeys,n); ArrayResize(gStopSaveValues,n);
+      GlobalVariablesFlush();
+   }
+}
+
+bool gRestoreReady=false;
+bool RestoreTradeState()
+{
+   if(IsTesting()) return(true);
+   string suffixes[10]={".close",".held",".tokyo",".tokyosell",".sellpartial",".buyblock",".sellblock",".retry",".splitwait",".legacyPartial"};
+   double values[10]={0,0,0,0,0,0,0,0,0,0};
+   for(int i=0;i<10;i++)
+   {
+      values[i]=0;
+      if(GlobalVariableCheck(statePrefix+suffixes[i]) &&
+         (!GlobalVariableGet(statePrefix+suffixes[i],values[i]) || !MathIsValidNumber(values[i]) || values[i]<0))
+      { Print(gLogIdentity,"event=STATE_RESTORE_PENDING key=",statePrefix+suffixes[i]); return(false); }
+   }
+   double send=0;
+   if(GlobalVariableCheck(gSendKey) && (!GlobalVariableGet(gSendKey,send) || !MathIsValidNumber(send))) return(false);
+   lastClose=(datetime)MathMax(lastClose,values[0]);
+   if(heldTicket<0 && values[1]>0) heldTicket=(int)values[1];
+   lastTokyoEntryDate=(int)MathMax(lastTokyoEntryDate,values[2]);
+   lastTokyoSellDate=(int)MathMax(lastTokyoSellDate,values[3]);
+   lastTokyoSellPartialDate=(int)MathMax(lastTokyoSellPartialDate,values[4]);
+   blockedBuyDate=(int)MathMax(blockedBuyDate,values[5]);
+   blockedSellDate=(int)MathMax(blockedSellDate,values[6]);
+   nextEntryAttempt=(datetime)MathMax(nextEntryAttempt,values[7]);
+   partialPendingDate=(int)values[8];
+   gLegacyPartialOpenTime=(datetime)values[9];
+   gSendNumber=send; gSendStateReadable=true;
+   return(true);
+}
+
+int gInstanceHandle=INVALID_HANDLE;
+bool gTimerEvent=false;
+uint gLastQuoteReceived=0;
+
 int OnInit()
 {
 
@@ -153,40 +460,56 @@ int OnInit()
    }
 
    if(!TC_Init(2000)) return(INIT_FAILED);
+   if(!IsTesting())
+   {
+      gInstanceHandle=FileOpen("EA.instance."+MailScope(MAGIC)+".lock",FILE_READ|FILE_WRITE|FILE_BIN);
+      if(gInstanceHandle==INVALID_HANDLE) { Print("event=INSTANCE_LOCK_FAILED ea=",COMMENT," error=",GetLastError()); return(INIT_FAILED); }
+      if(!EventSetTimer(1)) return(INIT_FAILED);
+   }
    gReleasePending = false;
-   gEntryMailTicket = -1;
-   partialPendingDate = 0;
+   string newPrefix="STR03."+MailScope(MAGIC);
+   if(statePrefix!=newPrefix)
+   {
+      lastBar=0; lastClose=0; lastTick=0; lastEquity=0; lastBalance=0;
+      gEntryMailTicket=-1; exitTicket=-1; stopTicket=-1; heldTicket=-1;
+      stopTarget=0; stopDistance=0; partialPendingDate=0;
+      lastTokyoEntryDate=0; lastTokyoSellDate=0; lastTokyoSellPartialDate=0;
+      blockedBuyDate=0; blockedSellDate=0; nextEntryAttempt=0;
+      partialBaseDate=0; partialBaseLots=0; splitStopDate=0; splitStopDistance=0;
+      gLegacyPrefix=""; gLegacyPartialOpenTime=0; gLegacyStateUncertain=false;
+      gSendNumber=0; gSendKnownTicket=-1; gSendCancelPending=false; gSendFinished=false; gSendStateReadable=true;
+      gRestoreReady=false; gSplitStopCompletedDate=0;
+      ArrayResize(gStopSaveKeys,0); ArrayResize(gStopSaveValues,0); ArrayResize(gStopCompletedTickets,0);
+      mailLastAttempt=0; mailAttempted=false; mailBaseline=0; ArrayResize(mailPendingTickets,0);
+   }
+   statePrefix=newPrefix;
+   gSendKey="S3S."+MailScope(MAGIC);
+   gTimerEvent=false; gLastQuoteReceived=0;
+   if(!IsTesting()) MailReconcile(COMMENT,MAGIC,true);
 
    // 運用中に装着・再初期化した場合は新規発注だけを途中参加させない。
    // 既存ポジションの決済・SL補正状態は端末Global Variableから復元する。
    if(!IsTesting())
    {
       lastBar = iTime(Symbol(), SignalTimeframe, 0);
-      statePrefix = "STR03." + IntegerToString(AccountNumber()) + "." + Symbol() + "." +
-                    IntegerToString(MAGIC);
+      string legacyPrefix = "STR03." + IntegerToString(AccountNumber()) + "." + Symbol() + "." + IntegerToString(MAGIC);
+      gLegacyPrefix=legacyPrefix;
+      gRestoreReady=RestoreTradeState();
+      // 旧保存値にはサーバー識別がない。所属不明の状態で新規・部分決済を再開しない。
+      if(!GlobalVariableCheck(statePrefix+".migrated") && (GlobalVariableCheck(legacyPrefix+".held") || GlobalVariableCheck(legacyPrefix+".buyblock") ||
+         GlobalVariableCheck(legacyPrefix+".sellblock") || GlobalVariableCheck(legacyPrefix+".splitwait")))
+      {
+         gLegacyStateUncertain=true;
+         Print(gLogIdentity,"event=LEGACY_STATE_SCOPE_UNCONFIRMED prefix=",legacyPrefix," message=new entries and partial closes suspended; full exits remain active");
+         Print(gLogIdentity,"event=LEGACY_UNFILLED_RECOVERY buy_key=",statePrefix,".legacyBuyClear sell_key=",statePrefix,
+               ".legacySellClear message=set only after confirming no fill; value must equal the corresponding legacy block YYYYMMDD before today JST");
+      }
       if(StringLen(statePrefix) + 18 > 63)
       {
          Print(gLogIdentity, "event=STATE_KEY_INVALID message=", "Persistent state key is too long for Symbol=", Symbol());
          return(INIT_PARAMETERS_INCORRECT);
       }
-      string closeKey = statePrefix + ".close";
       string heldKey = statePrefix + ".held";
-      if(GlobalVariableCheck(closeKey)) lastClose = (datetime)GlobalVariableGet(closeKey);
-      if(GlobalVariableCheck(heldKey)) heldTicket = (int)GlobalVariableGet(heldKey);
-      if(GlobalVariableCheck(statePrefix + ".tokyo"))
-         lastTokyoEntryDate = (int)GlobalVariableGet(statePrefix + ".tokyo");
-      if(GlobalVariableCheck(statePrefix + ".tokyosell"))
-         lastTokyoSellDate = (int)GlobalVariableGet(statePrefix + ".tokyosell");
-      if(GlobalVariableCheck(statePrefix + ".sellpartial"))
-         lastTokyoSellPartialDate = (int)GlobalVariableGet(statePrefix + ".sellpartial");
-      if(GlobalVariableCheck(statePrefix + ".buyblock"))
-         blockedBuyDate = (int)GlobalVariableGet(statePrefix + ".buyblock");
-      if(GlobalVariableCheck(statePrefix + ".sellblock"))
-         blockedSellDate = (int)GlobalVariableGet(statePrefix + ".sellblock");
-      if(GlobalVariableCheck(statePrefix + ".retry"))
-         nextEntryAttempt = (datetime)GlobalVariableGet(statePrefix + ".retry");
-      if(GlobalVariableCheck(statePrefix + ".splitwait"))
-         partialPendingDate = (int)GlobalVariableGet(statePrefix + ".splitwait");
       for(int i = OrdersTotal() - 1; i >= 0; i--)
       {
          if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
@@ -202,10 +525,13 @@ int OnInit()
          if(GlobalVariableCheck(ticketPrefix + ".exit")) exitTicket = heldTicket;
          if(GlobalVariableCheck(ticketPrefix + ".stop"))
          {
-            stopTicket = heldTicket;
-            stopDistance = GlobalVariableGet(ticketPrefix + ".stop");
+            double restoredWidth = 0;
+            if(!GlobalVariableGet(ticketPrefix + ".stop", restoredWidth) || !MathIsValidNumber(restoredWidth) || restoredWidth==0)
+               Print(gLogIdentity,"event=SL_STATE_READ_FAILED ticket=",heldTicket);
+            else if(restoredWidth>0) { stopTicket=heldTicket; stopDistance=restoredWidth; }
          }
       }
+      ReconcileLegacyState();
       GlobalVariablesFlush();
    }
    if(IsTesting())
@@ -248,6 +574,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
    if(gReleasePending) gReleasePending = !TC_End(true);
    if(equityFile != INVALID_HANDLE)
    {
@@ -255,22 +582,48 @@ void OnDeinit(const int reason)
       if(lastTick > 0)
          FileWrite(equityFile, TimeToString(lastTick, TIME_DATE | TIME_SECONDS),
                    DoubleToString(AccountEquity(), 2), DoubleToString(AccountBalance(), 2));
-      FileClose(equityFile);
+      FileClose(equityFile); equityFile=INVALID_HANDLE;
    }
    Print(gLogIdentity, "event=DEINIT reason=", reason);
+   if(gInstanceHandle!=INVALID_HANDLE) { FileClose(gInstanceHandle); gInstanceHandle=INVALID_HANDLE; }
 }
 
 //+------------------------------------------------------------------+
 //| ティック処理                                                     |
 //+------------------------------------------------------------------+
+void OnTimer()
+{
+   gTimerEvent=true;
+   OnTick();
+   gTimerEvent=false;
+}
 void OnTick()
 {
+   if(!gRestoreReady) gRestoreReady=RestoreTradeState();
+   ReconcileLegacyState();
+   RetryStopCompletion();
+   if(gSendNumber>0)
+   {
+      int reconciled=ResolveSendRecord();
+      if(reconciled>0 && OrderSelect(reconciled,SELECT_BY_TICKET) && OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC)
+      {
+         heldTicket=reconciled;
+         double width=0;
+         if(!IsTesting() && GlobalVariableGet(SendRecordKey()+".w",width) && MathIsValidNumber(width) && width>0 && OrderCloseTime()==0)
+         { stopTicket=reconciled; stopDistance=width; GlobalVariableSet(statePrefix+"."+IntegerToString(reconciled)+".stop",width); }
+         Print(gLogIdentity,"event=SEND_RECONCILED ticket=",reconciled);
+      }
+   }
+   if(!gTimerEvent) gLastQuoteReceived=GetTickCount();
+   if(gReleasePending) gReleasePending=!TC_End(true);
+   MailReconcile(COMMENT,MAGIC,true);
+   if(gTimerEvent && (!IsConnected() || gLastQuoteReceived==0 || (uint)(GetTickCount()-gLastQuoteReceived)>10000)) return;
    if(gReleasePending) gReleasePending = !TC_End(true);
    if(!gReleasePending && gEntryMailTicket >= 0 && OrderSelect(gEntryMailTicket, SELECT_BY_TICKET))
    {
       if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC &&
          (OrderType() == OP_BUY || OrderType() == OP_SELL))
-         MySendMail(COMMENT, OrderType() == OP_BUY ? 1 : 2);
+         MailNotifySelected(COMMENT,MAGIC,true);
       gEntryMailTicket = -1;
    }
    // このティックのサーバー時刻を取得し、売買できない場合も資産の観測値を更新する。
@@ -309,10 +662,11 @@ void OnTick()
    CorrectPendingStop(tick);
 
    datetime bar = iTime(Symbol(), SignalTimeframe, 0);
-   bool newBar = (bar > 0 && bar != lastBar);
+   bool newBar = (!gTimerEvent && bar > 0 && bar != lastBar);
 
    if(!ManageOpenOrders(tokyoDate, tokyoMinute, exitAttempted, bar, newBar)) return;
 
+   if(gTimerEvent || !gRestoreReady || gSendNumber>0 || gLegacyStateUncertain) return;
    // 保有注文がない場合だけ、直前の決済確認と新規発注の判定へ進む。
    if(!ResolveLastClosedOrder()) return;
 
@@ -452,7 +806,7 @@ void RetryPendingExit(bool &exitAttempted)
 void CorrectPendingStop(const double tick)
 {
    // スリッページがあれば、約定価格を基準に初期SLを補正する。既存SLは外さない。
-   if(stopTicket >= 0)
+   if(stopTicket >= 0 && MathIsValidNumber(stopDistance) && stopDistance > 0 && tick > 0)
    {
       // 約定価格を取得する。失敗しても補正待ちの状態は残し、後続ティックで扱う。
       if(!OrderSelect(stopTicket, SELECT_BY_TICKET))
@@ -469,7 +823,7 @@ void CorrectPendingStop(const double tick)
             {
                GlobalVariableSet(statePrefix + ".close", lastClose);
                GlobalVariableSet(stopPrefix + ".closed", lastClose);
-               GlobalVariableDel(stopPrefix + ".stop");
+               SaveStopCompletion(stopPrefix + ".stop", -stopDistance);
                GlobalVariablesFlush();
             }
          }
@@ -482,14 +836,16 @@ void CorrectPendingStop(const double tick)
             stopTarget = NormalizeDouble((OrderType() == OP_BUY ? MathFloor(target / tick) : MathCeil(target / tick)) * tick,
                                          Digits);
             // すでに目標のSLになっていれば、補正完了として保存状態を消す。
-            if(MathAbs(OrderStopLoss() - stopTarget) < tick / 2)
+            if(OrderStopLoss() > 0 && (OrderType() == OP_BUY ? OrderStopLoss() >= stopTarget - tick / 2 : OrderStopLoss() <= stopTarget + tick / 2))
             {
+               RememberCompletedStop(pendingStop);
                stopTicket = -1;
                splitStopDistance = 0;
                if(!IsTesting())
                {
-                  GlobalVariableDel(stopPrefix + ".stop");
-                  GlobalVariableDel(statePrefix + ".sstop." + IntegerToString(splitStopDate));
+                  SaveStopCompletion(stopPrefix + ".stop", -stopDistance);
+                  gSplitStopCompletedDate=splitStopDate;
+                  SaveStopCompletion(statePrefix + ".sstop." + IntegerToString(splitStopDate), -stopDistance);
                   GlobalVariablesFlush();
                }
             }
@@ -512,7 +868,7 @@ void CorrectPendingStop(const double tick)
                   if(!IsTradeAllowed() || (!IsTesting() && !IsConnected()) || market <= 0 ||
                      distance < MarketInfo(Symbol(), MODE_STOPLEVEL) * Point + tick || distance <= freeze ||
                      (freeze > 0 && OrderStopLoss() > 0 && MathAbs(market - OrderStopLoss()) <= freeze) ||
-                     MathAbs(OrderStopLoss() - stopTarget) < tick / 2)
+                     (OrderStopLoss() > 0 && (OrderType() == OP_BUY ? stopTarget <= OrderStopLoss() + tick / 2 : stopTarget >= OrderStopLoss() - tick / 2)))
                   { TC_End(false); return; }
                   ResetLastError();
                   bool modified = OrderModify(pendingStop, OrderOpenPrice(), stopTarget,
@@ -521,12 +877,14 @@ void CorrectPendingStop(const double tick)
                   gReleasePending = !TC_End(true);
                   if(modified)
                   {
+                     RememberCompletedStop(pendingStop);
                      stopTicket = -1;
                      splitStopDistance = 0;
                      if(!IsTesting())
                      {
-                        GlobalVariableDel(stopPrefix + ".stop");
-                        GlobalVariableDel(statePrefix + ".sstop." + IntegerToString(splitStopDate));
+                        SaveStopCompletion(stopPrefix + ".stop", -stopDistance);
+                        gSplitStopCompletedDate=splitStopDate;
+                        SaveStopCompletion(statePrefix + ".sstop." + IntegerToString(splitStopDate), -stopDistance);
                         GlobalVariablesFlush();
                      }
                   }
@@ -568,6 +926,15 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
       {
          GlobalVariableSet(statePrefix + ".held", activeTicket);
          if(GlobalVariableCheck(activePrefix + ".exit")) exitTicket = activeTicket;
+         bool completed=false;
+         for(int done=0;done<ArraySize(gStopCompletedTickets);done++)
+            if(gStopCompletedTickets[done]==activeTicket) completed=true;
+         if(!completed && stopTicket!=activeTicket && GlobalVariableCheck(activePrefix+".stop"))
+         {
+            double width=0;
+            if(GlobalVariableGet(activePrefix+".stop",width) && MathIsValidNumber(width) && width>0)
+            { stopTicket=activeTicket; stopDistance=width; }
+         }
       }
 
       int openTokyoDate = 0;
@@ -588,7 +955,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
          openTokyoDate = TimeYear(openTokyoTime) * 10000 +
                          TimeMonth(openTokyoTime) * 100 + TimeDay(openTokyoTime);
          int tokyoCloseMinute = (side == OP_BUY ? 9 * 60 + 55 : SellFinalMinute);
-         if(tokyoDate > openTokyoDate || tokyoMinute >= tokyoCloseMinute)
+         if(!gTimerEvent && (tokyoDate > openTokyoDate || tokyoMinute >= tokyoCloseMinute))
          {
             // 先に決済意思を保存する。発注失敗や再起動があっても再試行できる。
             exitTicket = activeTicket;
@@ -605,10 +972,13 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
       string splitStopKey = statePrefix + ".sstop." + IntegerToString(openTokyoDate);
       if(side == OP_SELL)
       {
-         if(!IsTesting() && GlobalVariableCheck(splitStopKey))
+         if(!IsTesting() && gSplitStopCompletedDate!=openTokyoDate && GlobalVariableCheck(splitStopKey))
          {
             splitStopDate = openTokyoDate;
-            splitStopDistance = GlobalVariableGet(splitStopKey);
+            double savedSplitWidth = 0;
+            if(GlobalVariableGet(splitStopKey, savedSplitWidth) && MathIsValidNumber(savedSplitWidth))
+               splitStopDistance = savedSplitWidth;
+            else splitStopDistance = 0;
          }
          if(splitStopDate == openTokyoDate && splitStopDistance > 0)
          {
@@ -618,10 +988,24 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
       }
       // 売りは10:00以降に一度だけ分割し、残りを最終時刻まで保有する。
       // 全量決済を優先し、初期SL補正待ちでも時刻による分割決済を行う。
-      if(side == OP_SELL && SellFinalMinute > TokyoExitMinute &&
+      if(!gTimerEvent && gRestoreReady && !gLegacyStateUncertain && OrderOpenTime()!=gLegacyPartialOpenTime &&
+         side == OP_SELL && SellFinalMinute > TokyoExitMinute &&
          tokyoDate == openTokyoDate && tokyoMinute >= TokyoExitMinute &&
          tokyoMinute < SellFinalMinute && exitTicket != activeTicket)
       {
+         if(!IsTesting() && GlobalVariableCheck(statePrefix + ".splitwait"))
+         {
+            double savedPendingDate=0;
+            if(!GlobalVariableGet(statePrefix + ".splitwait",savedPendingDate)) continue;
+            partialPendingDate=(int)savedPendingDate;
+         }
+         if(!IsTesting() && GlobalVariableCheck(statePrefix + ".sellpartial"))
+         {
+            double savedPartialDate = 0;
+            if(!GlobalVariableGet(statePrefix + ".sellpartial", savedPartialDate) || !MathIsValidNumber(savedPartialDate))
+            { Print(gLogIdentity, "event=PARTIAL_STATE_READ_FAILED"); continue; }
+            lastTokyoSellPartialDate = (int)MathMax(lastTokyoSellPartialDate,savedPartialDate);
+         }
          double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
          double minLot = MarketInfo(Symbol(), MODE_MINLOT);
          double actualLots = OrderLots();
@@ -633,7 +1017,10 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
             partialBaseDate = openTokyoDate;
             partialBaseLots = actualLots;
             if(!IsTesting() && GlobalVariableCheck(partialBaseKey))
-               partialBaseLots = GlobalVariableGet(partialBaseKey);
+            {
+               if(!GlobalVariableGet(partialBaseKey, partialBaseLots) || !MathIsValidNumber(partialBaseLots) || partialBaseLots <= 0)
+               { partialBaseDate = 0; continue; }
+            }
          }
          if(actualLots < partialBaseLots - lotTolerance &&
             lastTokyoSellPartialDate != openTokyoDate)
@@ -768,7 +1155,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
          }
       }
       // 買いは指定ATR幅の含み益に達したら、約定水準へSLを前進させる。
-      if(side == OP_BUY && BuyBreakEvenATR > 0 &&
+      if(!gTimerEvent && side == OP_BUY && BuyBreakEvenATR > 0 &&
          exitTicket != activeTicket && stopTicket != activeTicket)
       {
          double breakEvenAtrValue = iATR(Symbol(), SignalTimeframe, ATRPeriod, 2);
@@ -820,7 +1207,7 @@ bool ManageOpenOrders(const int tokyoDate, const int tokyoMinute,
          }
       }
       // 時刻決済と初期SL補正を優先し、利益が伸びた建玉だけのSLを追随させる。
-      if(exitTicket != activeTicket && stopTicket != activeTicket && TrailATR > 0)
+      if(!gTimerEvent && exitTicket != activeTicket && stopTicket != activeTicket && TrailATR > 0)
       {
          double trailAtr = iATR(Symbol(), SignalTimeframe, ATRPeriod, 2);
          double trailDistance = TrailATR * trailAtr;
@@ -896,7 +1283,9 @@ bool ResolveLastClosedOrder()
       bool heldResolved = false;
       if(!IsTesting() && GlobalVariableCheck(heldPrefix + ".closed"))
       {
-         datetime savedClose = (datetime)GlobalVariableGet(heldPrefix + ".closed");
+         double restoredClose=0;
+         if(!GlobalVariableGet(heldPrefix+".closed",restoredClose) || !MathIsValidNumber(restoredClose) || restoredClose<=0) return(false);
+         datetime savedClose=(datetime)restoredClose;
          if(savedClose > lastClose) lastClose = savedClose;
          heldResolved = true;
       }
@@ -989,6 +1378,8 @@ bool CheckTokyoEntry(const datetime tokyoNow, const int tokyoDate,
    int tokyoWeekday = TimeDayOfWeek(tokyoNow);
    bool tokyoEntryWindow = (tokyoMinute == TokyoEntryMinute || tokyoSellWindow);
    // 祝日表の対象年、銀行の休業日、指定分内かどうかを確認する。
+   if(tokyoYear < 2021 || tokyoYear > 2028)
+      Print(gLogIdentity,"event=HOLIDAY_TABLE_OUT_OF_RANGE year=",tokyoYear);
    if(tokyoYear < 2021 || tokyoYear > 2028 || dstTransitionSunday ||
       tokyoWeekday == 0 || tokyoWeekday == 6 ||
       (tokyoMonth == 12 && tokyoDay == 31) ||
@@ -1063,6 +1454,7 @@ void OpenTokyoPosition(const datetime now, const double tick,
                        const int tokyoDate, const bool tokyoSellWindow)
 {
    // 成否不明・恒久エラーの同日同方向再送を止め、一時エラーの連発を抑える。
+   if(!gRestoreReady || gLegacyStateUncertain || gSendNumber>0) return;
    if((tokyoSellWindow ? blockedSellDate : blockedBuyDate) == tokyoDate ||
       TimeCurrent() < nextEntryAttempt) return;
    if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) return;
@@ -1116,24 +1508,8 @@ void OpenTokyoPosition(const datetime now, const double tick,
    }
    // 処理中に指定分を過ぎた場合も、遅刻発注は行わない。
    if(TimeCurrent() >= now - TimeSeconds(now) + 60) { TC_End(false); return; }
-   // 送信前に保留を永続化する。成否不明や送信中の再起動では再送しない。
-   string blockKey = statePrefix + (side == OP_SELL ? ".sellblock" : ".buyblock");
-   int previousBlock = (side == OP_SELL ? blockedSellDate : blockedBuyDate);
-   if(side == OP_SELL) blockedSellDate = tokyoDate;
-   else blockedBuyDate = tokyoDate;
-   if(!IsTesting())
-   {
-      if(GlobalVariableSet(blockKey, tokyoDate) == 0)
-      {
-         int saveError = GetLastError();
-         TC_End(false);
-         if(side == OP_SELL) blockedSellDate = previousBlock;
-         else blockedBuyDate = previousBlock;
-         Print(gLogIdentity, "event=ENTRY_STATE_SAVE_FAILED message=", "Entry state save failed; entry suspended error=", saveError);
-         return;
-      }
-      GlobalVariablesFlush();
-   }
+   string blockKey=statePrefix+(side==OP_SELL ? ".sellblock" : ".buyblock");
+   int previousBlock=(side==OP_SELL ? blockedSellDate : blockedBuyDate);
    bool sendUnoccupied = true;
    for(int check = OrdersTotal() - 1; check >= 0; check--)
    {
@@ -1173,11 +1549,44 @@ void OpenTokyoPosition(const datetime now, const double tick,
       TC_End(false);
       return;
    }
+   gSendNumber=MathMax(MathAbs(gSendNumber)+1,(double)TimeLocal()*1000.0);
+   if(!PrepareSendRecord(side,FixedLots)) { TC_End(false); return; }
+   if(!IsTesting() && (GlobalVariableSet(SendRecordKey()+".w",StopATR*atr)==0 ||
+      GlobalVariableSet(SendRecordKey()+".prev",previousBlock)==0 || GlobalVariableSet(blockKey,tokyoDate)==0))
+   { gSendCancelPending=true; FinishSendRecord(); TC_End(false); return; }
+   if(side==OP_SELL) blockedSellDate=tokyoDate; else blockedBuyDate=tokyoDate;
+   if(!CommitSendRecord()) { TC_End(false); return; }
+   // 記録保存による遅延も含め、API直前に時刻・占有・気配・数量・証拠金を再確認する。
+   sendUnoccupied=true;
+   for(int current=OrdersTotal()-1;current>=0;current--)
+   {
+      if(!OrderSelect(current,SELECT_BY_POS,MODE_TRADES)) { sendUnoccupied=false; break; }
+      if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC) { sendUnoccupied=false; break; }
+   }
+   ResetLastError(); freeAfter=AccountFreeMarginCheck(Symbol(),side,FixedLots); marginError=GetLastError();
+   RefreshRates();
+   GetTokyoClock(TimeCurrent(),currentTokyo,currentDate,currentMinute,currentTransition);
+   entry=side==OP_BUY ? Ask : Bid;
+   stop=entry+(side==OP_BUY ? -1.0 : 1.0)*StopATR*atr;
+   stop=NormalizeDouble((side==OP_BUY ? MathFloor(stop/tick) : MathCeil(stop/tick))*tick,Digits);
+   step=MarketInfo(Symbol(),MODE_LOTSTEP);
+   sendValid=sendUnoccupied && marginError==0 && freeAfter>0 && step>0 &&
+      FixedLots>=MarketInfo(Symbol(),MODE_MINLOT) && FixedLots<=MarketInfo(Symbol(),MODE_MAXLOT) &&
+      MathAbs(FixedLots/step-MathRound(FixedLots/step))<=1e-7 && IsTradeAllowed() && (IsTesting() || IsConnected()) &&
+      currentDate==tokyoDate && currentMinute==(tokyoSellWindow ? 595 : TokyoEntryMinute) && Bid>0 && Ask>=Bid && stop>0 &&
+      (long)MathRound(Ask/Point)-(long)MathRound(Bid/Point)<=maxSpreadPoints &&
+      (side==OP_BUY ? Bid-stop : stop-Ask)>=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point+tick;
+   if(!sendValid) { gSendCancelPending=true; FinishSendRecord(); TC_End(false); return; }
    ResetLastError();
    int ticket = OrderSend(Symbol(), side, FixedLots, entry, Slippage, stop, 0,
-                          COMMENT, MAGIC, 0, clrNONE);
+                          "R"+DoubleToString(gSendNumber,0)+"|"+COMMENT, MAGIC, 0, clrNONE);
    int error = GetLastError();
    gReleasePending = !TC_End(true);
+   gSendKnownTicket=ticket;
+   bool unknown=ticket<0 && (error==0 || error==1 || error==2 || error==6 || error==128);
+   gSendFinished=!unknown;
+   if(ticket>0 && !IsTesting()) GlobalVariableSet(SendRecordKey()+".k",ticket);
+   if(!unknown) FinishSendRecord();
    if(ticket < 0)
    {
       Print(gLogIdentity, "event=ENTRY_FAILED message=", "Entry failed error=", error);
@@ -1204,7 +1613,7 @@ void OpenTokyoPosition(const datetime now, const double tick,
    }
    if(!gReleasePending && OrderSelect(ticket,SELECT_BY_TICKET) &&
       (OrderType()==OP_BUY || OrderType()==OP_SELL))
-      MySendMail(COMMENT,OrderType()==OP_BUY ? 1 : 2);
+      MailNotifySelected(COMMENT,MAGIC,true);
    else gEntryMailTicket = ticket;
    // 発注成功後にだけ、保有チケット、固定SL幅、当日の売買実績を更新する。
    stopTicket = ticket;

@@ -31,6 +31,7 @@
 #property description "ロンドン始値レンジ突破。M15確定足・H1 ATR・日次1回。"
 
 #include <Original/TradeControl.mqh>
+#include <Original/Mail.mqh>
 
 #define MAGIC 20261004
 #define COMMENT "STR12_USDJPY_M15"
@@ -66,13 +67,19 @@ datetime gLastBar = 0;
 datetime gLastTradeBar = 0, gLastExitBar = 0;
 long gLastTradeDay = -1;
 bool gEntryReady = false, gStateHealthy = true;
+bool gRestorePending = true;
 // 注文待ちは発注試行に数えない。シグナルの方向・SL・数量は予約時のまま保持する。
 int gEntrySide = -1;
 datetime gEntryBar = 0;
 double gEntryStop = 0, gEntryLots = 0, gEntryATR = 0;
 bool gReleasePending = false; // End失敗時は注文を再送せず、解放だけを再試行する。
 int gExitTickets[];
-datetime gExitRetryTimes[];
+int gExitRetainTicket=-1;
+uint gExitRetryTimes[];
+bool gExitRetried[];
+bool gDayStateReadable = true;
+bool gDayRepairPending=false;
+long gDayRepairValue=-1;
 // テスター内だけで日次の有効証拠金・残高を記録する。
 int gEquityFile = INVALID_HANDLE;
 datetime gEquityLastTick = 0;
@@ -81,14 +88,21 @@ double gEquityLastValue = 0, gEquityLastBalance = 0;
 //+------------------------------------------------------------------+
 //| 初期化：入力確認と売買状態の復元                                 |
 //+------------------------------------------------------------------+
+int gInstanceHandle=INVALID_HANDLE;
+bool gTimerEvent=false;
+uint gLastQuoteReceived=0;
+
 int OnInit()
 {
    // USDJPY・M15専用。シグナル条件、時刻、リスク設定の有効範囲を確認する
    gLogIdentity="ea="+COMMENT+" ";
+   // 再初期化で未送信候補を引き継がない。現在銘柄の確定足から改めて判定する。
+   gEntrySide=-1; gEntryBar=0; gEntryStop=0; gEntryLots=0; gEntryATR=0;
+   gTimerEvent=false; gLastQuoteReceived=0;
    if(TradeSymbol!="USDJPY" || SignalTimeframe!=PERIOD_M15 || Period()!=PERIOD_M15 || StringSubstr(Symbol(),0,6)!=TradeSymbol ||
       ATRPeriod<1 || (ATRTimeframe!=PERIOD_M15 && ATRTimeframe!=PERIOD_M30 && ATRTimeframe!=PERIOD_H1 && ATRTimeframe!=PERIOD_H4) ||
       RangeStartLondon<0 || RangeStartLondon>=1440 || RangeStartLondon%15!=0 || RangeBars<1 || RangeBars>96 ||
-      EntryWindowBars<1 || EntryWindowBars>96 || RangeStartLondon+(RangeBars+EntryWindowBars)*15>1440 || StopATR<=0 ||
+      EntryWindowBars<1 || EntryWindowBars>96 || RangeStartLondon+(RangeBars+EntryWindowBars)*15>=1440 || StopATR<=0 ||
       HoldBars<1 || BuyHoldBars<0 || !MathIsValidNumber(RangeStopFloorATR) || RangeStopFloorATR<0 || RangeStopFloorATR>StopATR ||
       EntryRiskPercent<=0 || EntryRiskPercent>0.5 || MaxSpreadPips<=0 || Slippage<0 ||
       FridayExitUTC<0 || FridayExitUTC>=1440 ||
@@ -96,45 +110,38 @@ int OnInit()
       BrokerSummerUTCOffset < -12 || BrokerSummerUTCOffset>14)
       return(INIT_PARAMETERS_INCORRECT);
    if(!TC_Init(2000)) return(INIT_FAILED); // 他の参加EAと同じ送信間隔。初回は待たない。
+   if(!IsTesting())
+   {
+      gInstanceHandle=FileOpen("EA.instance."+MailScope(MAGIC)+".lock",FILE_READ|FILE_WRITE|FILE_BIN);
+      if(gInstanceHandle==INVALID_HANDLE) { Print("event=INSTANCE_LOCK_FAILED ea=",COMMENT," error=",GetLastError()); return(INIT_FAILED); }
+      if(!EventSetTimer(1)) return(INIT_FAILED);
+   }
    // 原本と同じMagic・短い保存キーを使い、再起動後も日次制限と決済要求を引き継ぐ
    string scope=AccountServer()+"|"+Symbol();
    uint scopeHash=2166136261;
    for(int k=0;k<StringLen(scope);k++) scopeHash=(scopeHash^(uint)StringGetCharacter(scope,k))*16777619;
-   gExitPrefix="STR12.X."+IntegerToString(AccountNumber())+"."+IntegerToString(MAGIC)+"."+IntegerToString((int)scopeHash)+".";
-   gTradeDayKey="STR12.D."+IntegerToString(AccountNumber())+"."+IntegerToString(MAGIC)+"."+IntegerToString((int)scopeHash)+"."+IntegerToString((int)SignalTimeframe);
-   if(!IsTesting() && GlobalVariableCheck(gTradeDayKey)) gLastTradeDay=(long)GlobalVariableGet(gTradeDayKey);
-   // 注文と履歴から最終発注バー・ロンドン日付・決済バーを復元する
-   for(int pool=0;pool<2;pool++)
+   string newPrefix="STR12.X."+IntegerToString(AccountNumber())+"."+IntegerToString(MAGIC)+"."+IntegerToString((int)scopeHash)+".";
+   if(gExitPrefix!=newPrefix)
    {
-      int total=(pool==0 ? OrdersTotal() : OrdersHistoryTotal());
-      for(int i=0;i<total;i++)
-      {
-         if(!OrderSelect(i, SELECT_BY_POS, pool == 0 ? MODE_TRADES : MODE_HISTORY))
-         {
-            Print(gLogIdentity, "event=INIT_HISTORY_SELECT_FAILED error=", GetLastError());
-            return(INIT_FAILED);
-         }
-         if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC || (OrderType()!=OP_BUY && OrderType()!=OP_SELL)) continue;
-         int openedShift=iBarShift(Symbol(),SignalTimeframe,OrderOpenTime(),false);
-         datetime openedBar=(openedShift>=0 ? iTime(Symbol(),SignalTimeframe,openedShift) : 0);
-         if(openedBar>gLastTradeBar) gLastTradeBar=openedBar;
-         // 約定日時も当時の時差でロンドン日付に変換する
-         datetime opened=OrderOpenTime();
-         int oy=TimeYear(opened-BrokerWinterUTCOffset*3600);
-         datetime omar=StrToTime(IntegerToString(oy)+".03.01 09:00"),onov=StrToTime(IntegerToString(oy)+".11.01 09:00");
-         datetime ods=omar+(7-TimeDayOfWeek(omar))%7*86400+7*86400,ode=onov+(7-TimeDayOfWeek(onov))%7*86400;
-         int openOffset=BrokerWinterUTCOffset;
-         if(UseUSDST && opened>=ods && opened<ode) openOffset=BrokerSummerUTCOffset;
-         datetime openedUTC=opened-openOffset*3600;
-         int ly=TimeYear(openedUTC);
-         datetime lmar=StrToTime(IntegerToString(ly)+".03.31 01:00"),loct=StrToTime(IntegerToString(ly)+".10.31 01:00");
-         datetime lds=lmar-TimeDayOfWeek(lmar)*86400,lde=loct-TimeDayOfWeek(loct)*86400;
-         long openedDay=(long)(openedUTC+(openedUTC>=lds && openedUTC<lde ? 3600 : 0))/86400;
-         if(openedDay>gLastTradeDay) gLastTradeDay=openedDay;
-         datetime currentBar=iTime(Symbol(),SignalTimeframe,0);
-         if(currentBar>0 && OrderCloseTime()>=currentBar) gLastExitBar=currentBar;
-      }
+      gLastBar=0; gLastTradeBar=0; gLastExitBar=0; gLastTradeDay=-1;
+      gStateHealthy=true; gExitRetainTicket=-1;
+      gDayStateReadable=true; gDayRepairPending=false; gDayRepairValue=-1;
+      ArrayResize(gExitTickets,0); ArrayResize(gExitRetryTimes,0); ArrayResize(gExitRetried,0);
+      gEquityLastTick=0; gEquityLastValue=0; gEquityLastBalance=0;
+      mailLastAttempt=0; mailAttempted=false; mailBaseline=0; ArrayResize(mailPendingTickets,0);
    }
+   gExitPrefix=newPrefix;
+   gReleasePending=false;
+   gRestorePending=true;
+   if(!IsTesting()) MailReconcile(COMMENT,MAGIC,false);
+   gTradeDayKey="STR12.D."+IntegerToString(AccountNumber())+"."+IntegerToString(MAGIC)+"."+IntegerToString((int)scopeHash)+"."+IntegerToString((int)SignalTimeframe);
+   if(!IsTesting() && GlobalVariableCheck(gTradeDayKey))
+   {
+      double savedDay = 0;
+      gDayStateReadable = GlobalVariableGet(gTradeDayKey, savedDay) && MathIsValidNumber(savedDay) && savedDay==MathFloor(savedDay);
+      if(gDayStateReadable) gLastTradeDay = (long)MathMax(gLastTradeDay,(long)savedDay);
+   }
+   // 復元走査はTick/Timerで再試行する。一時的な選択失敗で既存建玉の管理を停止しない。
    if(IsTesting())
    {
       gEquityLastTick=0;gEquityLastValue=0;gEquityLastBalance=0;
@@ -164,6 +171,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
    if(gReleasePending) gReleasePending=!TC_End(true);
    if(IsTesting() && gEquityFile!=INVALID_HANDLE)
    {
@@ -176,13 +184,29 @@ void OnDeinit(const int reason)
       }
       FileClose(gEquityFile);gEquityFile=INVALID_HANDLE;
    }
+   if(gInstanceHandle!=INVALID_HANDLE) { FileClose(gInstanceHandle); gInstanceHandle=INVALID_HANDLE; }
 }
 
 //+------------------------------------------------------------------+
 //| ティック処理：決済管理と新バーの初回突破判定                     |
 //+------------------------------------------------------------------+
+void OnTimer()
+{
+   gTimerEvent=true;
+   OnTick();
+   gTimerEvent=false;
+}
 void OnTick()
 {
+   if(!gTimerEvent) gLastQuoteReceived=GetTickCount();
+   if(gReleasePending) gReleasePending=!TC_End(true);
+   MailReconcile(COMMENT,MAGIC,false);
+   if(gDayRepairPending && !IsTesting())
+   {
+      if(GlobalVariableSet(gTradeDayKey,(double)gDayRepairValue)!=0)
+      { GlobalVariablesFlush(); gDayRepairPending=false; }
+   }
+   bool quoteFresh=!gTimerEvent || (IsConnected() && gLastQuoteReceived!=0 && (uint)(GetTickCount()-gLastQuoteReceived)<=10000);
    // サーバー時刻をUTCへ換算し、金曜の決済期限と週末を判定する
    datetime now=TimeCurrent();
    if(IsTesting() && gEquityFile!=INVALID_HANDLE)
@@ -223,29 +247,59 @@ void OnTick()
 
    // 実運用の再起動時は次のM15新バーを待ち、直前足の確定と履歴を確認する
    datetime bar=iTime(Symbol(),SignalTimeframe,0);
-   if(!gEntryReady && bar>0){gLastBar=bar;gEntryReady=true;}
+   if(!gTimerEvent && !gEntryReady && bar>0){gLastBar=bar;gEntryReady=true;}
    int requiredBars=7;
    bool seriesReady=(iBars(Symbol(),SignalTimeframe)>=requiredBars && bar>0 && bar<=now &&
                      iTime(Symbol(),SignalTimeframe,requiredBars-1)>0 && iTime(Symbol(),SignalTimeframe,1)>0 &&
                      iTime(Symbol(),SignalTimeframe,1)+PeriodSeconds(SignalTimeframe)<=now);
-   bool newBar=(seriesReady && bar!=gLastBar);
+   bool newBar=(!gTimerEvent && seriesReady && bar!=gLastBar);
    if(newBar) gLastBar=bar;
-   if(newBar)
+   bool priorHealthy=gStateHealthy,scanHealthy=true;
+   gStateHealthy=false;
+   if(gRestorePending || newBar || !priorHealthy)
    {
-      for(int h=OrdersHistoryTotal()-1;h>=0;h--)
+      for(int pool=0;pool<2;pool++)
       {
-         if(!OrderSelect(h,SELECT_BY_POS,MODE_HISTORY))
-         {Print(gLogIdentity,"event=HISTORY_SELECT_FAILED error=",GetLastError());gStateHealthy=false;return;}
-         if(OrderSymbol()==Symbol() && OrderMagicNumber()==MAGIC &&
-            (OrderType()==OP_BUY || OrderType()==OP_SELL) && OrderCloseTime()>=bar)
-            gLastExitBar=bar;
+         if(pool==0 && !gRestorePending) continue;
+         int total=(pool==0 ? OrdersTotal() : OrdersHistoryTotal());
+         for(int i=0;i<total;i++)
+         {
+            if(!OrderSelect(i, SELECT_BY_POS, pool == 0 ? MODE_TRADES : MODE_HISTORY))
+            {
+               Print(gLogIdentity, "event=RESTORE_HISTORY_SELECT_FAILED error=", GetLastError());
+               scanHealthy=false; continue;
+            }
+            if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC || (OrderType()!=OP_BUY && OrderType()!=OP_SELL)) continue;
+            if(gRestorePending)
+            {
+               int openedShift=iBarShift(Symbol(),SignalTimeframe,OrderOpenTime(),false);
+               datetime openedBar=(openedShift>=0 ? iTime(Symbol(),SignalTimeframe,openedShift) : 0);
+               if(openedBar>gLastTradeBar) gLastTradeBar=openedBar;
+               // 約定日時も当時の時差でロンドン日付に変換する
+               datetime opened=OrderOpenTime();
+               int oy=TimeYear(opened-BrokerWinterUTCOffset*3600);
+               datetime omar=StrToTime(IntegerToString(oy)+".03.01 09:00"),onov=StrToTime(IntegerToString(oy)+".11.01 09:00");
+               datetime ods=omar+(7-TimeDayOfWeek(omar))%7*86400+7*86400,ode=onov+(7-TimeDayOfWeek(onov))%7*86400;
+               int openOffset=BrokerWinterUTCOffset;
+               if(UseUSDST && opened>=ods && opened<ode) openOffset=BrokerSummerUTCOffset;
+               datetime openedUTC=opened-openOffset*3600;
+               int ly=TimeYear(openedUTC);
+               datetime lmar=StrToTime(IntegerToString(ly)+".03.31 01:00"),loct=StrToTime(IntegerToString(ly)+".10.31 01:00");
+               datetime lds=lmar-TimeDayOfWeek(lmar)*86400,lde=loct-TimeDayOfWeek(loct)*86400;
+               long openedDay=(long)(openedUTC+(openedUTC>=lds && openedUTC<lde ? 3600 : 0))/86400;
+               if(openedDay>gLastTradeDay) gLastTradeDay=openedDay;
+            }
+            datetime currentBar=iTime(Symbol(),SignalTimeframe,0);
+            if(currentBar>0 && OrderCloseTime()>=currentBar) gLastExitBar=currentBar;
+         }
       }
+      if(gRestorePending) gRestorePending=!scanHealthy;
    }
    // SLと保有期限・日付変更・週末条件で決済する。同一銘柄・Magicだけを管理する
    bool occupied=false,closedThisTick=false;
    for(int i=OrdersTotal()-1;i>=0;i--)
    {
-      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)){Print(gLogIdentity,"event=ORDER_SELECT_FAILED error=",GetLastError());return;}
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)){Print(gLogIdentity,"event=ORDER_SELECT_FAILED error=",GetLastError());scanHealthy=false;continue;}
       if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MAGIC) continue;
       occupied=true;
       if(OrderType()!=OP_BUY && OrderType()!=OP_SELL) continue;
@@ -268,26 +322,28 @@ void OnTick()
       int pending=-1;
       for(int j=0;j<ArraySize(gExitTickets);j++) if(gExitTickets[j]==ticket) pending=j;
       bool saved=(!IsTesting() && GlobalVariableCheck(key));
-      if(!mustExit && pending<0 && !saved) continue;
+      if(gTimerEvent && pending<0 && !saved && gExitRetainTicket!=ticket) continue;
+      if(!mustExit && pending<0 && !saved && gExitRetainTicket!=ticket) continue;
       // 決済要求をチケット別に保持し、通信失敗後は5秒以上空けて再試行する
       if(pending<0)
       {
          int size=ArraySize(gExitTickets);
-         bool retryResized=(ArrayResize(gExitRetryTimes,size+1)==size+1);
+         bool retryResized=(ArrayResize(gExitRetryTimes,size+1)==size+1 && ArrayResize(gExitRetried,size+1)==size+1);
          bool ticketResized=(ArrayResize(gExitTickets,size+1)==size+1);
          if(!retryResized || !ticketResized)
-         {ArrayResize(gExitTickets,size);ArrayResize(gExitRetryTimes,size);gStateHealthy=false;Print(gLogIdentity,"event=EXIT_REQUEST_RETAIN_FAILED ticket=",ticket);return;}
-         pending=size;gExitTickets[pending]=ticket;gExitRetryTimes[pending]=0;
+         {gExitRetainTicket=ticket;if(!IsTesting() && GlobalVariableSet(key,1.0)!=0) GlobalVariablesFlush();ArrayResize(gExitTickets,size);ArrayResize(gExitRetryTimes,size);ArrayResize(gExitRetried,size);scanHealthy=false;Print(gLogIdentity,"event=EXIT_REQUEST_RETAIN_FAILED ticket=",ticket);continue;}
+         pending=size;gExitTickets[pending]=ticket;if(gExitRetainTicket==ticket) gExitRetainTicket=-1;gExitRetryTimes[pending]=0;gExitRetried[pending]=false;
       }
       if(!IsTesting() && !saved)
       {
          ResetLastError();
-         if(GlobalVariableSet(key,1.0)==0){gStateHealthy=false;Print(gLogIdentity,"event=EXIT_STATE_SAVE_FAILED ticket=",ticket," error=",GetLastError());}
+         if(GlobalVariableSet(key,1.0)==0){scanHealthy=false;Print(gLogIdentity,"event=EXIT_STATE_SAVE_FAILED ticket=",ticket," error=",GetLastError());}
          else GlobalVariablesFlush();
       }
-      if(now<gExitRetryTimes[pending]) continue;
+      uint retryNow=IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount();
+      if(gExitRetried[pending] && (uint)(retryNow-gExitRetryTimes[pending])<5000) continue;
       // 間隔待ちでは、決済要求と既存の5秒再試行時刻をそのまま残す。
-      if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) continue;
+      if(!quoteFresh || gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) continue;
       RefreshRates();
       ResetLastError();
       if(!OrderSelect(ticket,SELECT_BY_TICKET))
@@ -302,10 +358,11 @@ void OnTick()
          ((OrderStopLoss() > 0 && (side == OP_BUY ? exitPrice - OrderStopLoss() : OrderStopLoss() - exitPrice) <= freeze) ||
           (OrderTakeProfit() > 0 && (side == OP_BUY ? OrderTakeProfit() - exitPrice : exitPrice - OrderTakeProfit()) <= freeze)))
          {TC_End(false);continue;} // 凍結距離を外れるまで決済要求を保持する
-      gExitRetryTimes[pending] = now + 5;
       ResetLastError();
       bool closed=OrderClose(ticket,OrderLots(),side==OP_BUY ? Bid : Ask,Slippage,clrNONE);
       int error=GetLastError();
+      gExitRetryTimes[pending]=IsTesting() ? (uint)((long)TimeCurrent()*1000) : GetTickCount();
+      gExitRetried[pending]=true;
       gReleasePending=!TC_End(true);
       if(!closed)
          Print(gLogIdentity,"event=EXIT_FAILED ticket=",ticket," error=",error," retry_after_seconds=5");
@@ -313,16 +370,28 @@ void OnTick()
       {
          closedThisTick=true;gLastExitBar=bar;
          int last=ArraySize(gExitTickets)-1;
-         gExitTickets[pending]=gExitTickets[last];gExitRetryTimes[pending]=gExitRetryTimes[last];
-         ArrayResize(gExitTickets,last);ArrayResize(gExitRetryTimes,last);
+         gExitTickets[pending]=gExitTickets[last];gExitRetryTimes[pending]=gExitRetryTimes[last];gExitRetried[pending]=gExitRetried[last];
+         ArrayResize(gExitTickets,last);ArrayResize(gExitRetryTimes,last);ArrayResize(gExitRetried,last);
          if(!IsTesting() && GlobalVariableCheck(key))
          {if(!GlobalVariableDel(key)) Print(gLogIdentity,"event=EXIT_STATE_CLEANUP_FAILED ticket=",ticket," error=",GetLastError());GlobalVariablesFlush();}
       }
    }
 
+   if(gExitRetainTicket>0)
+   {
+      if(OrderSelect(gExitRetainTicket,SELECT_BY_TICKET) && OrderCloseTime()>0) gExitRetainTicket=-1;
+      else scanHealthy=false;
+   }
+   gStateHealthy=scanHealthy; // 全走査が完了した状態だけで復旧を確定する。
    // 未送信の候補は次のM15バーへ持ち越さない。決済・日次・時間条件も毎Tick確認する。
    if(gEntryBar!=bar) gEntrySide=-1;
-   if(occupied || closedThisTick || !gStateHealthy ||
+   if(!gDayStateReadable && !IsTesting())
+   {
+      double savedDay=0;
+      if(GlobalVariableGet(gTradeDayKey,savedDay) && MathIsValidNumber(savedDay) && savedDay==MathFloor(savedDay))
+      { gLastTradeDay=(long)MathMax(gLastTradeDay,(long)savedDay); gDayStateReadable=true; }
+   }
+   if(occupied || closedThisTick || gRestorePending || !gStateHealthy || !gDayStateReadable || gDayRepairPending ||
       now<TradeStartTime || weekendFlat || !londonBusinessDay || gLastTradeDay>=londonDay ||
       gLastTradeBar>=bar || gLastExitBar>=bar)
    {gEntrySide=-1;return;}
@@ -423,7 +492,7 @@ void OnTick()
    }
 
    // 同じTickで権利が取れれば従来と同時に送信。待機しても日次予約はまだ消費しない。
-   if(gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) return;
+   if(!quoteFresh || gReleasePending || (!IsTesting() && !IsConnected()) || !TC_Begin()) return;
    // 権利取得後に自分の注文と決済履歴を再確認し、重複発注・決済バーの再入場を防ぐ。
    for(int pool=0;pool<2;pool++)
    {
@@ -443,7 +512,7 @@ void OnTick()
       ResetLastError();
       if(GlobalVariableSet(gTradeDayKey, (double)londonDay) == 0)
       {
-         gStateHealthy = false;
+         gDayRepairPending=true; gDayRepairValue=gLastTradeDay;
          int error=GetLastError();
          TC_End(false);gEntrySide=-1;
          Print(gLogIdentity, "event=TRADE_DAY_SAVE_FAILED error=", error);
@@ -488,7 +557,7 @@ void OnTick()
       {
          ResetLastError();
          if(GlobalVariableSet(gTradeDayKey,(double)gLastTradeDay)==0)
-         {gStateHealthy=false;Print(gLogIdentity,"event=TRADE_DAY_RESTORE_FAILED error=",GetLastError());}
+         {gDayRepairPending=true;gDayRepairValue=gLastTradeDay;Print(gLogIdentity,"event=TRADE_DAY_RESTORE_FAILED error=",GetLastError());}
          GlobalVariablesFlush();
       }
       TC_End(false);gEntrySide=-1;return;

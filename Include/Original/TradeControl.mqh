@@ -38,6 +38,10 @@ int      tc_interval_ms=0;                // 0は未初期化/設定エラー
 int      tc_lock=INVALID_HANDLE;          // 実行権。テスター内だけは0を使用
 string   tc_account="";                   // 初期化後の口座切替を検出する
 datetime tc_test_completed=0;             // テスター内の前回API完了時刻
+bool     tc_completion_pending=false;    // 完了保存失敗をEnd(false)で解除しない
+bool     tc_file_waiting=false;
+uint     tc_file_wait_started=0, tc_log_tick=0;
+string   tc_last_error="";
 
 // 設定を受け取るだけなので、複数EAが同時に初期化しても実行権を取り合わない。
 // 実運用の設定一致はBeginで確認する。間隔を変える時は全EAの設定を揃えて端末再起動。
@@ -47,6 +51,7 @@ bool TC_Init(int interval_ms)
    tc_interval_ms=interval_ms;
    tc_account=AccountServer()+"#"+IntegerToString(AccountNumber());
    tc_test_completed=0;
+   tc_completion_pending=false; tc_file_waiting=false; tc_last_error="";
    return(true);
 }
 
@@ -66,41 +71,90 @@ bool TC_Begin()
       return(true);
    }
 
-   // FILE_SHARE_*を付けず、同じファイルを他EAが同時に開けないようにする。
+   // FILE_SHARE_*を付けない。通常の排他待ちを障害と断定せず、長時間待機だけを通知する。
+   ResetLastError();
    tc_lock=FileOpen("TradeControl.simple.lock",FILE_BIN|FILE_READ|FILE_WRITE);
-   if(tc_lock==INVALID_HANDLE) return(false);
-
-   // 必ず実行権取得後に時刻を読む。他EAが送信する前の古い値は使わない。
-   // Tempは既存値を上書きしない。端末終了時には消えるのでPC再起動にも持ち越さない。
-   double interval=0, completed=0;
-   if(GlobalVariableTemp("TradeControl.simple.interval") &&
-      GlobalVariableTemp("TradeControl.simple.completed") &&
-      GlobalVariableGet("TradeControl.simple.interval",interval) &&
-      GlobalVariableGet("TradeControl.simple.completed",completed))
+   if(tc_lock==INVALID_HANDLE)
    {
-      // 最初に利用するEAが共通間隔を設定する。この処理も排他区間内で行う。
-      if(interval==0 && GlobalVariableSet("TradeControl.simple.interval",tc_interval_ms)!=0)
-         interval=tc_interval_ms;
-      if(interval==tc_interval_ms)
+      int file_error=GetLastError();
+      if(!tc_file_waiting){ tc_file_waiting=true; tc_file_wait_started=GetTickCount(); }
+      if((uint)(GetTickCount()-tc_file_wait_started)>=30000)
       {
-         // 0は未送信を表すため、共有時刻はGetTickCount()+1で記録する。
-         // uintの差分で約49.7日ごとのカウンタ一周にも対応する。
-         if(completed==0 || (uint)(GetTickCount()-(uint)(completed-1.0))>=(uint)tc_interval_ms)
-            return(true); // Endまでハンドルを保持し、実行権を渡さない。
+         Print("[TradeControl] api=FileOpen key=TradeControl.simple.lock error=",file_error,
+               " state=WAITING reason=lock_busy_or_io_failure");
+         tc_file_wait_started=GetTickCount();
       }
-      else
+      return(false);
+   }
+   tc_file_waiting=false;
+
+   // 一時GVは既存時に再作成しない。各APIを個別に確認し、一過性障害では設定を破棄しない。
+   string keys[3]={"TradeControl.simple.interval","TradeControl.simple.completed","TradeControl.simple.active"};
+   double values[3]={0,0,0};
+   string failure="";
+   int error=0;
+   for(int i=0;i<3;i++)
+   {
+      ResetLastError();
+      if(!GlobalVariableCheck(keys[i]) && !GlobalVariableTemp(keys[i]))
+      { error=GetLastError(); failure="api=GlobalVariableTemp key="+keys[i]; break; }
+      ResetLastError();
+      if(!GlobalVariableGet(keys[i],values[i]))
+      { error=GetLastError(); failure="api=GlobalVariableGet key="+keys[i]; break; }
+      if(!MathIsValidNumber(values[i]) || values[i]<0)
+      { failure="api=ValidateState key="+keys[i]; break; }
+   }
+   if(failure=="")
+   {
+      if(values[0]==0)
       {
-         Print("[TradeControl] 送信間隔が他EAと異なります。全EAの設定を揃えてください。");
-         tc_interval_ms=0; // 同じ設定エラーを毎Tick出力しない。
+         ResetLastError();
+         if(GlobalVariableSet(keys[0],tc_interval_ms)==0)
+         { error=GetLastError(); failure="api=GlobalVariableSet key="+keys[0]; }
+         else values[0]=tc_interval_ms;
+      }
+      if(failure=="" && values[0]!=tc_interval_ms)
+         failure="api=ValidateInterval key="+keys[0]+" reason=interval_mismatch";
+      if(failure=="" && (values[1]>4294967296.0 || values[1]!=MathFloor(values[1]) ||
+                          (values[2]!=0 && values[2]!=1)))
+         failure="api=ValidateState reason=invalid_completion_or_active";
+      if(failure=="" && values[2]==1)
+      {
+         // 排他ファイルを取得できたのにactiveなら、前所有者は保存を完了せず終了した。
+         // 注文を再送せず、観測時刻から共通間隔を取り直して次の要求を待たせる。
+         ResetLastError();
+         if(GlobalVariableSet(keys[1],(double)GetTickCount()+1.0)==0)
+         { error=GetLastError(); failure="api=GlobalVariableSet key="+keys[1]+" phase=recover"; }
+         else
+         {
+            ResetLastError();
+            if(GlobalVariableSet(keys[2],0)==0)
+            { error=GetLastError(); failure="api=GlobalVariableSet key="+keys[2]+" phase=recover"; }
+            else Print("[TradeControl] state=RECOVERED reason=previous_owner_incomplete interval_ms=",tc_interval_ms);
+         }
+         // 復旧したイベントでは注文を許可しない。
+      }
+      else if(failure=="" && (values[1]==0 ||
+              (uint)(GetTickCount()-(uint)(values[1]-1.0))>=(uint)tc_interval_ms))
+      {
+         // API前の印は、完了時刻が書けないまま所有EAが終了する場合の間隔保護に使う。
+         ResetLastError();
+         if(GlobalVariableSet(keys[2],1)==0)
+         { error=GetLastError(); failure="api=GlobalVariableSet key="+keys[2]+" phase=begin"; }
+         else
+         {
+            if(tc_last_error!="") Print("[TradeControl] state=READY reason=storage_recovered");
+            tc_last_error="";
+            return(true);
+         }
       }
    }
-   else
+   if(failure!="" && (failure!=tc_last_error || (uint)(GetTickCount()-tc_log_tick)>=30000))
    {
-      Print("[TradeControl] 共通の送信時刻を読み取れないため、送信を停止します。");
-      tc_interval_ms=0;
+      Print("[TradeControl] ",failure," error=",error," state=WAIT_RETRY");
+      tc_last_error=failure; tc_log_tick=GetTickCount();
    }
-
-   FileClose(tc_lock); // 間隔待ち/設定エラーなら、実行権だけを返す。
+   FileClose(tc_lock);
    tc_lock=INVALID_HANDLE;
    return(false);
 }
@@ -111,21 +165,47 @@ bool TC_Begin()
 bool TC_End(bool api_called)
 {
    if(tc_lock==INVALID_HANDLE) return(false);
+   if(tc_completion_pending && !api_called) return(false);
    if(IsTesting())
    {
       if(api_called) tc_test_completed=TimeCurrent();
    }
    else
    {
-      if(api_called &&
-         GlobalVariableSet("TradeControl.simple.completed",(double)GetTickCount()+1.0)==0)
+      if(api_called)
       {
-         // 時刻更新に失敗したまま次の送信を許さない。注文結果はEA側で処理する。
-         Print("[TradeControl] 送信時刻の更新に失敗したため、実行権を保持します。");
+         tc_completion_pending=true;
+         ResetLastError();
+         if(GlobalVariableSet("TradeControl.simple.completed",(double)GetTickCount()+1.0)==0)
+         {
+            int error=GetLastError();
+            string failure="api=GlobalVariableSet key=TradeControl.simple.completed phase=end";
+            if(failure!=tc_last_error || (uint)(GetTickCount()-tc_log_tick)>=30000)
+            {
+               Print("[TradeControl] ",failure," error=",error," state=LOCK_HELD_RETRY");
+               tc_last_error=failure; tc_log_tick=GetTickCount();
+            }
+            return(false);
+         }
+      }
+      ResetLastError();
+      if(GlobalVariableSet("TradeControl.simple.active",0)==0)
+      {
+         int error=GetLastError();
+         string failure="api=GlobalVariableSet key=TradeControl.simple.active phase=end";
+         if(failure!=tc_last_error || (uint)(GetTickCount()-tc_log_tick)>=30000)
+         {
+            Print("[TradeControl] ",failure," error=",error," api_called=",api_called);
+            tc_last_error=failure; tc_log_tick=GetTickCount();
+         }
+         if(api_called) return(false); // API完了保存と所有印の消去が揃うまで保持する。
+         // 未送信ならロックを返せる。残ったactiveは次Beginが保守的に間隔待ちへ復旧する。
+         FileClose(tc_lock); tc_lock=INVALID_HANDLE;
          return(false);
       }
       FileClose(tc_lock);
    }
+   tc_completion_pending=false;
    tc_lock=INVALID_HANDLE;
    return(true);
 }
