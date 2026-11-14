@@ -51,22 +51,22 @@ string gLogIdentity = "";
 //+------------------------------------------------------------------+
 //| EAパラメータ設定情報                                             |
 //+------------------------------------------------------------------+
-extern string TradeSymbol = "USDJPY";
-extern int SignalTimeframe = PERIOD_M30; // 選定版はM30固定
-extern int TokyoEntryMinute = 590;     // JST09:50固定
-extern int TokyoExitMinute = 600;      // JST10:00固定
-extern int SellFinalMinute = 630;      // 売り残余の決済時刻: 600/615/630/660
-extern int SellFirstClosePercent = 50; // 売りのJST10:00部分決済率: 30/50/70%
-extern double BuyBreakEvenATR = 0.25;  // 買い建値SL開始: 0/0.125/0.25/0.375/0.5 ATR
-extern int SettlementDaysOnly = 1;     // 1=5の倍数日+月末、休日の前倒しなし（固定）
-extern double StopATR = 2.0;           // 選定版はATR20shift2の2倍に固定
-extern int ATRPeriod = 20;             // ATR期間: 14/20/28/40
-extern int CooldownDays = 1;           // 決済後休止: 完了した平日のシグナル時間足バー数（名前は互換性のため維持）
-extern double FixedLots = 0.2;
-extern double MaxSpreadPips = 2.0;
-extern int Slippage = 50;              // point単位、各発注・決済要求に適用
-extern string EquityFileName = "";       // 空なら実行時刻を含む一意なCSV名を生成
-extern double TrailATR = 0.75;         // 0=無効、含み益が同ATR幅に達したら追随
+sinput string TradeSymbol = "USDJPY";
+sinput int SignalTimeframe = PERIOD_M30; // 選定版はM30固定
+sinput int TokyoEntryMinute = 590;     // JST09:50固定
+sinput int TokyoExitMinute = 600;      // JST10:00固定
+input int SellFinalMinute = 630;      // 売り残余の決済時刻: 600/615/630/660
+input int SellFirstClosePercent = 50; // 売りのJST10:00部分決済率: 30/50/70%
+input double BuyBreakEvenATR = 0.25;  // 買い建値SL開始: 0/0.125/0.25/0.375/0.5 ATR
+sinput int SettlementDaysOnly = 1;     // 1=5の倍数日+月末、休日の前倒しなし（固定）
+sinput double StopATR = 2.0;           // 選定版はATR20shift2の2倍に固定
+sinput int ATRPeriod = 20;             // ATR期間: 14/20/28/40
+sinput int CooldownDays = 1;           // 決済後休止: 完了した平日のシグナル時間足バー数（名前は互換性のため維持）
+sinput double FixedLots = 0.2;
+sinput double MaxSpreadPips = 2.0;
+sinput int Slippage = 50;              // point単位、各発注・決済要求に適用
+sinput string EquityFileName = "";       // 空なら実行時刻を含む一意なCSV名を生成
+input double TrailATR = 0.75;         // 0=無効、含み益が同ATR幅に達したら追随
 
 //+------------------------------------------------------------------+
 //| グローバル変数                                                   |
@@ -480,7 +480,7 @@ int OnInit()
       gSendNumber=0; gSendKnownTicket=-1; gSendCancelPending=false; gSendFinished=false; gSendStateReadable=true;
       gRestoreReady=false; gSplitStopCompletedDate=0;
       ArrayResize(gStopSaveKeys,0); ArrayResize(gStopSaveValues,0); ArrayResize(gStopCompletedTickets,0);
-      mailLastAttempt=0; mailAttempted=false; mailBaseline=0; ArrayResize(mailPendingTickets,0);
+      mailBaseline=0;
    }
    statePrefix=newPrefix;
    gSendKey="S3S."+MailScope(MAGIC);

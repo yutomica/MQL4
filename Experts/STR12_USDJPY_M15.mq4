@@ -128,7 +128,7 @@ int OnInit()
       gDayStateReadable=true; gDayRepairPending=false; gDayRepairValue=-1;
       ArrayResize(gExitTickets,0); ArrayResize(gExitRetryTimes,0); ArrayResize(gExitRetried,0);
       gEquityLastTick=0; gEquityLastValue=0; gEquityLastBalance=0;
-      mailLastAttempt=0; mailAttempted=false; mailBaseline=0; ArrayResize(mailPendingTickets,0);
+      mailBaseline=0;
    }
    gExitPrefix=newPrefix;
    gReleasePending=false;

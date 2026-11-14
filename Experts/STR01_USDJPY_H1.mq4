@@ -10,13 +10,14 @@
   新バーごとに確定済み直近En_bars本の最高値へBuy Stop、最安値へSell Stopを同一ロットでOCO発注する。全条件が一致する既存ペアは保持する。
   片側が約定すると反対側を取り消す。
 - Ex:
-  含み益がATR×HalfATRMultを超えると一度だけ半分を決済する。
+  約定足の直前確定ATR×HalfATRMultと初期SL幅×PartialRiskMultの小さい方を超え、費用込み含み益が正なら指定比率で一度だけ分割決済する。
   残りはSL、ATR×TrailATRMultの追尾、またはTimeStopBars本経過後の手数料・swap込み含み損決済で終了する。
 - TP/SL:
   固定TPは設定しない（TP=0）。初期SLはBuyが確定済み直近SL_bars本の最安値、Sellが最高値。
   エントリーからSLまでの距離はSLLimitPips未満かつブローカーの最小距離以上を必須とする。両候補のいずれかが距離上限以上となる局面では、新規発注を見送る。
 - トレーリングストップ:
-  ATRPeriod・ATRShiftのH1 ATRを幅として使用し、SLが建値以上（Sellは建値以下）になる含み益へ到達後、価格に追随して有利な方向にだけSLを更新する。
+  分割決済を確認した残玉だけに、約定足直前の確定H1 ATRを固定幅として使用する。
+  部分決済確認後、現在の含み益幅×ProfitLockFractionを保護するSLとATR追尾の有利な方を選び、SLは有利な方向にだけ更新する。
 - ポジション数・ロット:
   1回のOCOペアにつき約定対象は原則1建玉で、待機注文は同時に最大2件。
   ロットは残高と有効証拠金の小さい方にEntryRiskPercentを掛け、Buy/Sell双方のSL損失額の厳しい側で算出し、半分決済後も最小ロットを残せる数量へ切り下げる。
@@ -38,17 +39,20 @@
 extern uint MyOrderWaitingTime = 5;
 extern int Slippage = 50;
 extern int En_bars = 12;
-extern int SL_bars = 7;
+extern int SL_bars = 1;
 extern int ATRPeriod = 3;
 extern double SLLimitPips = 50.0;
 extern double EntryRiskPercent = 0.3;
 extern double FreeMarginBufferPercent = 30.0;
 extern int TimeStopBars = 10;
-extern int ATRShift = 0;
-extern double HalfATRMult = 3.0;
+extern int ATRShift = 0; // 互換用。0/1とも約定H1足の直前確定足を使う。
+extern double HalfATRMult = 2.0;
 extern double TrailATRMult = 3.0;
 extern int MaxOpenPositions = 6; // 0なら従来比較用に保有数を制限しない
 extern double MaxSpreadPips = 2.0;
+extern double PartialCloseFraction = 0.25;
+extern double PartialRiskMult = 0.5;
+extern double ProfitLockFraction = 0.5;
 
 
 // 注文間隔は参加EAで揃える。2秒はSTR01の従来値を引き継ぐ。
@@ -217,6 +221,8 @@ int OnInit()
       En_bars<1 || SL_bars<1 || ATRPeriod<1 || SLLimitPips<=0 || TimeStopBars<1 ||
       ATRShift<0 || ATRShift>1 || HalfATRMult<=0 || TrailATRMult<=0 || MaxOpenPositions<0 ||
       MaxSpreadPips<=0 || Slippage<0 || EntryRiskPercent<=0 ||
+      PartialCloseFraction<=0 || PartialCloseFraction>=1 || PartialRiskMult<=0 ||
+      ProfitLockFraction<0 || ProfitLockFraction>=1 ||
       FreeMarginBufferPercent<0 || FreeMarginBufferPercent>=100){
       Print(gLogIdentity,"event=INIT_PARAMETERS_INVALID");
       return(INIT_PARAMETERS_INCORRECT);
@@ -404,30 +410,46 @@ bool SaveHalfClose(string key,double value,double baseLots=0)
    return(true);
 }
 
-bool IsHalfCloseDone(string &key)
+bool IsHalfCloseDone(string &key,bool confirmedOnly=false)
 {
    double tick=MarketInfo(Symbol(),MODE_TICKSIZE);
-   if(tick<=0 || Point<=0) return(true);
+   if(tick<=0 || Point<=0) return(!confirmedOnly);
    string prefix="S1H_"+IntegerToString(AccountNumber())+"_"+Symbol()+"_"+IntegerToString(MAGIC)+"_"+
                  IntegerToString(OrderType())+"_"+IntegerToString((int)OrderOpenTime())+"_";
    key=prefix+DoubleToString(MathRound(OrderOpenPrice()/tick),0);
    // 旧版が保存したキーも読む。既存建玉を改修後にもう一度半分決済しない。
    string legacy=prefix+DoubleToString(MathRound(OrderOpenPrice()/(tick*Point)),0);
    double value=0, baseLots=0;
-   for(int i=0;i<ArraySize(gHalfRecords);i++)
+   bool found=false;
+   for(int i=ArraySize(gHalfRecords)-1;i>=0;i--)
       if(gHalfRecords[i].key==key || gHalfRecords[i].key==legacy){
          value=gHalfRecords[i].value; baseLots=gHalfRecords[i].baseLots;
+         found=true; break;
       }
+   // 未決済の0状態も記憶し、同じ建玉で過去の全記録を毎Tick検索しない。
+   if(!found){
+      int size=ArraySize(gHalfRecords);
+      if(ArrayResize(gHalfRecords,size+1)==size+1){
+         gHalfRecords[size].key=key; gHalfRecords[size].value=0; gHalfRecords[size].baseLots=0;
+      }
+   }
    if(!IsTesting()){
-      if(GlobalVariableCheck(legacy)) return(true);
-      if(GlobalVariableCheck(key) && !GlobalVariableGet(key,value)) return(true);
-      if(value<0 && !GlobalVariableGet(key+"_B",baseLots)) return(true);
+      if(GlobalVariableCheck(legacy)){
+         if(!confirmedOnly) return(true);
+         double legacyValue=0, legacyBase=0;
+         if(!GlobalVariableGet(legacy,legacyValue)) return(false);
+         return(legacyValue>0 || (legacyValue<0 && GlobalVariableGet(legacy+"_B",legacyBase) &&
+                legacyBase>-legacyValue && OrderLots()<=-legacyValue+1e-8));
+      }
+      if(GlobalVariableCheck(key) && !GlobalVariableGet(key,value)) return(!confirmedOnly);
+      if(value<0 && !GlobalVariableGet(key+"_B",baseLots)) return(!confirmedOnly);
    }
    if(value<0 && baseLots>-value && OrderLots()<=-value+1e-8){
       // 実注文の残量が予定以下なら、応答を失っていても半分決済済みと確認できる。
       if(!SaveHalfClose(key,1)) Print(gLogIdentity,"event=HALF_SAVE_FAILED key=",key);
+      value=1;
    }
-   return(value!=0); // 未確認の負値も再送せず、次Tickの残量照合に回す。
+   return(confirmedOnly ? value>0 : value!=0); // 未確認の負値は再送も追尾もしない。
 }
 
 void NotifyFills(){
@@ -656,8 +678,6 @@ void OnTick()
    }
 
    // ⑤ 退出処理は時間決済→半分決済→追尾の順。失敗したticketに枠を独占させない。
-   double atr=iATR(NULL,PERIOD_H1,ATRPeriod,ATRShift);
-   int halfPoints=int(atr*HalfATRMult/Point), trailPoints=int(atr*TrailATRMult/Point);
    double exitTick=MarketInfo(Symbol(),MODE_TICKSIZE);
    double exitStop=NormalizeDouble(MarketInfo(Symbol(),MODE_STOPLEVEL)*Point,Digits);
    double exitFreeze=NormalizeDouble(MarketInfo(Symbol(),MODE_FREEZELEVEL)*Point,Digits);
@@ -681,11 +701,20 @@ void OnTick()
    }
 
    total=OrdersTotal(); start=gHalfCursor>=0 && gHalfCursor<total ? gHalfCursor : 0;
-   for(int offset=0;offset<total && !gTimerEvent && quoteFresh && startupReady && !called && !gReleasePending && halfPoints>0;offset++){
+   for(int offset=0;offset<total && !gTimerEvent && quoteFresh && startupReady && !called && !gReleasePending;offset++){
       int index=(start+offset)%total;
       if(!OrderSelect(index,SELECT_BY_POS) || !OwnOrder() || OrderType()>OP_SELL) continue;
       string key="";
-      if(IsHalfCloseDone(key)) continue;
+      if(IsHalfCloseDone(key) || OrderProfit()+OrderSwap()+OrderCommission()<=0) continue;
+      // 約定したH1足より前に確定したATRを使い、保有中も基準を固定する。
+      int entryShift=iBarShift(NULL,PERIOD_H1,OrderOpenTime())+MathMax(1,ATRShift);
+      if(entryShift<1) continue;
+      double halfDistance=iATR(NULL,PERIOD_H1,ATRPeriod,entryShift)*HalfATRMult;
+      // 初回分割決済前はSL未変更なので、その距離を初期リスク幅として使う。
+      double initialRisk=OrderStopLoss()>0 ? MathAbs(OrderOpenPrice()-OrderStopLoss()) : 0;
+      if(initialRisk>0) halfDistance=MathMin(halfDistance,initialRisk*PartialRiskMult);
+      int halfPoints=int(halfDistance/Point);
+      if(halfDistance<=0) continue;
       double distance=OrderType()==OP_BUY ? Bid-OrderOpenPrice() : OrderOpenPrice()-Ask;
       if(distance<=halfPoints*Point) continue;
       int ticket=OrderTicket();
@@ -695,9 +724,11 @@ void OnTick()
          TC_End(false); continue;
       }
       distance=OrderType()==OP_BUY ? Bid-OrderOpenPrice() : OrderOpenPrice()-Ask;
-      double closeLots=NormalizeLotsDown(OrderLots()/2.0,MarketInfo(Symbol(),MODE_LOTSTEP));
-      double remaining=NormalizeDouble(OrderLots()-closeLots,8), minimum=MarketInfo(Symbol(),MODE_MINLOT);
-      if(distance<=halfPoints*Point || closeLots<minimum || remaining<minimum || !CanCloseSelected(OrderType(),exitFreeze)){
+      double minimum=MarketInfo(Symbol(),MODE_MINLOT);
+      double closeLots=NormalizeLotsDown(OrderLots()*PartialCloseFraction,MarketInfo(Symbol(),MODE_LOTSTEP));
+      closeLots=NormalizeDouble(MathMax(minimum,MathMin(OrderLots()-minimum,closeLots)),8);
+      double remaining=NormalizeDouble(OrderLots()-closeLots,8);
+      if(distance<=halfPoints*Point || OrderProfit()+OrderSwap()+OrderCommission()<=0 || closeLots<minimum || remaining<minimum || !CanCloseSelected(OrderType(),exitFreeze)){
          TC_End(false); continue;
       }
       // 決済前に予定残量を保存。タイムアウトや異常終了後も未決済扱いには戻さない。
@@ -706,7 +737,7 @@ void OnTick()
       }
       RefreshRates();
       if((!IsTesting() && !IsConnected()) || !OrderSelect(ticket,SELECT_BY_TICKET) || !OwnOrder() || OrderCloseTime()!=0 || OrderType()>OP_SELL ||
-         MathAbs(OrderLots()-closeLots-remaining)>1e-8 ||
+         MathAbs(OrderLots()-closeLots-remaining)>1e-8 || OrderProfit()+OrderSwap()+OrderCommission()<=0 ||
          (OrderType()==OP_BUY ? Bid-OrderOpenPrice() : OrderOpenPrice()-Ask)<=halfPoints*Point ||
          !CanCloseSelected(OrderType(),exitFreeze)){
          if(!SaveHalfClose(key,0)) Print(gLogIdentity,"event=HALF_SAVE_FAILED key=",key);
@@ -722,20 +753,27 @@ void OnTick()
    }
 
    total=OrdersTotal(); start=gTrailCursor>=0 && gTrailCursor<total ? gTrailCursor : total-1;
-   for(int offset=0;offset<total && !gTimerEvent && quoteFresh && startupReady && !called && !gReleasePending && trailPoints>0 && exitTick>0 && exitStop>=0 && exitFreeze>=0;offset++){
+   for(int offset=0;offset<total && !gTimerEvent && quoteFresh && startupReady && !called && !gReleasePending && exitTick>0 && exitStop>=0 && exitFreeze>=0;offset++){
       int index=(start-offset+total)%total;
       if(!OrderSelect(index,SELECT_BY_POS) || !OwnOrder() || OrderType()>OP_SELL) continue;
+      string partialKey="";
+      if(!IsHalfCloseDone(partialKey,true)) continue;
+      int entryShift=iBarShift(NULL,PERIOD_H1,OrderOpenTime())+MathMax(1,ATRShift);
+      if(entryShift<1) continue;
+      int trailPoints=int(iATR(NULL,PERIOD_H1,ATRPeriod,entryShift)*TrailATRMult/Point);
+      if(trailPoints<=0) continue;
       int ticket=OrderTicket();
-      double stop=OrderType()==OP_BUY ? NormalizeDouble(MathFloor((Bid-trailPoints*Point)/exitTick+1e-7)*exitTick,Digits) :
-                                       NormalizeDouble(MathCeil((Ask+trailPoints*Point)/exitTick-1e-7)*exitTick,Digits);
+      double stop=OrderType()==OP_BUY ? NormalizeDouble(MathFloor(MathMax(OrderOpenPrice()+MathMax(0,Bid-OrderOpenPrice())*ProfitLockFraction,Bid-trailPoints*Point)/exitTick+1e-7)*exitTick,Digits) :
+                                       NormalizeDouble(MathCeil(MathMin(OrderOpenPrice()-MathMax(0,OrderOpenPrice()-Ask)*ProfitLockFraction,Ask+trailPoints*Point)/exitTick-1e-7)*exitTick,Digits);
       bool improves=OrderType()==OP_BUY ? stop>=OrderOpenPrice() && (OrderStopLoss()==0 || stop>OrderStopLoss()+0.5*Point) :
                                          stop<=OrderOpenPrice() && (OrderStopLoss()==0 || stop<OrderStopLoss()-0.5*Point);
       if(!improves || !CanModifySelected(OrderType(),stop,exitStop,exitFreeze)) continue;
       if(!TC_Begin()) break;
       RefreshRates();
-      if(!OrderSelect(ticket,SELECT_BY_TICKET) || !OwnOrder() || OrderCloseTime()!=0 || OrderType()>OP_SELL){ TC_End(false); continue; }
-      stop=OrderType()==OP_BUY ? NormalizeDouble(MathFloor((Bid-trailPoints*Point)/exitTick+1e-7)*exitTick,Digits) :
-                                NormalizeDouble(MathCeil((Ask+trailPoints*Point)/exitTick-1e-7)*exitTick,Digits);
+      if(!OrderSelect(ticket,SELECT_BY_TICKET) || !OwnOrder() || OrderCloseTime()!=0 || OrderType()>OP_SELL ||
+         !IsHalfCloseDone(partialKey,true)){ TC_End(false); continue; }
+      stop=OrderType()==OP_BUY ? NormalizeDouble(MathFloor(MathMax(OrderOpenPrice()+MathMax(0,Bid-OrderOpenPrice())*ProfitLockFraction,Bid-trailPoints*Point)/exitTick+1e-7)*exitTick,Digits) :
+                                NormalizeDouble(MathCeil(MathMin(OrderOpenPrice()-MathMax(0,OrderOpenPrice()-Ask)*ProfitLockFraction,Ask+trailPoints*Point)/exitTick-1e-7)*exitTick,Digits);
       improves=OrderType()==OP_BUY ? stop>=OrderOpenPrice() && (OrderStopLoss()==0 || stop>OrderStopLoss()+0.5*Point) :
                                    stop<=OrderOpenPrice() && (OrderStopLoss()==0 || stop<OrderStopLoss()-0.5*Point);
       if(!improves || !CanModifySelected(OrderType(),stop,exitStop,exitFreeze)){ TC_End(false); continue; }

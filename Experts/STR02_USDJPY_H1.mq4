@@ -50,14 +50,14 @@ int gEntryMailTickets[]; // 約定通知待ちの注文ticket
 //+------------------------------------------------------------------+
 //| ストラテジーパラメータ                                         |
 //+------------------------------------------------------------------+
-input string TradeSymbol = "USDJPY";
+sinput string TradeSymbol = "USDJPY";
+sinput double EntryRiskPercent = 0.25;
+sinput double MaxSpreadPips = 2.0;
+sinput bool AllowNewEntries = true; // falseでも既存ポジションの決済は継続する。
 input double RSIEntry = 7.5;
 input double RSIExit = 40.0;
 input double StopATR = 2.5;
 input int HoldBars = 24;
-input double EntryRiskPercent = 0.25;
-input double MaxSpreadPips = 2.0;
-input bool AllowNewEntries = true; // falseでも既存ポジションの決済は継続する。
 input double MinATRSpreadRatio = 17.5; // 0で無効。ATRとAsk-Bidを同じ価格単位で比較する。
 input double EntryPullbackATR = 0.2; // 0で従来の成行注文。正値ではATR押し目・戻り指値を発注する。
 
@@ -267,7 +267,7 @@ int OnInit()
       stateHealthy=true; exitRetainTicket=-1;
       ArrayResize(exitTickets,0); ArrayResize(exitRetryTimes,0); ArrayResize(exitRetried,0);
       gSendNumber=0; gSendKnownTicket=-1; gSendCancelPending=false; gSendFinished=false; gSendStateReadable=true;
-      mailLastAttempt=0; mailAttempted=false; mailBaseline=0; ArrayResize(mailPendingTickets,0);
+      mailBaseline=0;
    }
    exitPrefix=newPrefix;
    if(!IsTesting()) MailReconcile(COMMENT,MAGIC,false);
